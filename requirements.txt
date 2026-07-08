@@ -4,6 +4,6 @@ matplotlib
 seaborn
 scikit-learn
 joblib
-strealit
+streamlit
 plotly
 jupyter
