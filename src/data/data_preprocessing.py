@@ -1,539 +1,673 @@
-"""Data preprocessing pipeline for the CIC-IDS2017 network intrusion dataset.
+"""
+data_preprocessing.py
+======================
 
-This module defines the ``DataPreprocessor`` class, which implements a full
-extract-clean-encode-scale-split-save pipeline for building a network
-intrusion intelligence system on top of the CIC-IDS2017 dataset.
+Data preprocessing pipeline for the Enterprise Network Intrusion Intelligence
+System. This module is responsible for loading the raw CICIDS2017
+(cleaned & preprocessed variant) network traffic dataset, performing data
+cleaning, handling missing/infinite values, encoding categorical labels,
+scaling numerical features, splitting the data into train/test partitions,
+and persisting both the processed datasets and the fitted transformation
+artifacts (scaler, label encoder) for downstream use by the modeling and
+inference pipelines.
 
-Typical usage example:
+Dataset reference:
+    https://www.kaggle.com/datasets/ericanacletoribeiro/cicids2017-cleaned-and-preprocessed
 
-    preprocessor = DataPreprocessor(
-        raw_data_dir="data/raw",
-        processed_data_dir="data/processed",
-        target_column="Label",
-    )
-    processed_df = preprocessor.run_pipeline()
-    X_train, X_test, y_train, y_test = preprocessor.split_dataset(processed_df)
+Author: Member A - Enterprise Network Intrusion Intelligence System
+Python Version: 3.11
 """
 
 from __future__ import annotations
 
 import logging
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
+# --------------------------------------------------------------------------- #
+# Logging Configuration
+# --------------------------------------------------------------------------- #
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    logger.setLevel(logging.INFO)
+    _console_handler = logging.StreamHandler(sys.stdout)
+    _console_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(_console_handler)
+
+
+# --------------------------------------------------------------------------- #
+# Custom Exceptions
+# --------------------------------------------------------------------------- #
+class DataPreprocessingError(Exception):
+    """Raised when an unrecoverable error occurs during data preprocessing."""
+
+
+class DataValidationError(DataPreprocessingError):
+    """Raised when the input dataset fails structural or content validation."""
+
+
+# --------------------------------------------------------------------------- #
+# Configuration Dataclass
+# --------------------------------------------------------------------------- #
+@dataclass
+class PreprocessingConfig:
+    """
+    Configuration container for the preprocessing pipeline.
+
+    Attributes:
+        raw_data_path: Path to the raw CICIDS2017 CSV file(s).
+        processed_data_dir: Directory where processed artifacts are written.
+        models_dir: Directory where fitted transformers (scaler, encoder)
+            are persisted.
+        target_column: Name of the column containing the traffic label
+            (e.g., 'Label' or 'Attack_Type').
+        test_size: Fraction of data reserved for the test split.
+        random_state: Seed used for reproducibility across random operations.
+        drop_duplicates: Whether duplicate rows should be removed.
+        scale_features: Whether numeric features should be standardized.
+        stratify: Whether the train/test split should be stratified on the
+            target column.
+        columns_to_drop: Optional list of known non-informative columns
+            (e.g., 'Flow ID', 'Timestamp') to remove prior to modeling.
+    """
+
+    raw_data_path: Path
+    processed_data_dir: Path = Path("data/processed")
+    models_dir: Path = Path("models")
+    target_column: str = "Label"
+    test_size: float = 0.2
+    random_state: int = 42
+    drop_duplicates: bool = True
+    scale_features: bool = True
+    stratify: bool = True
+    columns_to_drop: list[str] = field(
+        default_factory=lambda: [
+            "Flow ID",
+            "Source IP",
+            "Src IP",
+            "Destination IP",
+            "Dst IP",
+            "Timestamp",
+            "SimillarHTTP",
+            "Unnamed: 0",
+        ]
     )
 
 
+# --------------------------------------------------------------------------- #
+# Core Preprocessing Class
+# --------------------------------------------------------------------------- #
 class DataPreprocessor:
-    """End-to-end preprocessing pipeline for the CIC-IDS2017 dataset.
+    """
+    Encapsulates the full data preprocessing workflow for CICIDS2017 network
+    intrusion traffic data.
 
-    This class loads raw CSV files, inspects and cleans them, encodes
-    categorical features, scales numerical features, splits the dataset
-    into train/test partitions, and persists the processed dataset to
-    disk.
+    The pipeline performs the following ordered steps:
+        1. Load raw data from disk.
+        2. Validate structural integrity (non-empty, target column present).
+        3. Normalize column names (strip whitespace).
+        4. Drop known non-informative / identifier columns.
+        5. Handle infinite values by converting them to NaN.
+        6. Handle missing values via row/column-level strategies.
+        7. Remove duplicate records.
+        8. Encode the target label column.
+        9. Split features/target into train and test sets.
+        10. Scale numeric features (fit on train, transform on test).
+        11. Persist processed datasets and fitted artifacts to disk.
 
-    Attributes:
-        raw_data_dir: Directory containing raw CSV files.
-        processed_data_dir: Directory where processed artifacts are saved.
-        target_column: Name of the target/label column, if present.
-        test_size: Fraction of data reserved for the test split.
-        random_state: Random seed used for reproducibility.
-        raw_data: The merged raw DataFrame after ``load_dataset``.
-        processed_data: The cleaned/encoded/scaled DataFrame.
-        label_encoders: Mapping of column name to fitted ``LabelEncoder``.
-        scaler: Fitted ``StandardScaler`` instance, once ``scale_features``
-            has run.
+    Example:
+        >>> config = PreprocessingConfig(raw_data_path=Path("data/raw/cicids2017.csv"))
+        >>> preprocessor = DataPreprocessor(config)
+        >>> X_train, X_test, y_train, y_test = preprocessor.run()
     """
 
-    def __init__(
-        self,
-        raw_data_dir: str = "data/raw",
-        processed_data_dir: str = "data/processed",
-        target_column: Optional[str] = "Label",
-        test_size: float = 0.2,
-        random_state: int = 42,
-    ) -> None:
-        """Initializes the DataPreprocessor.
+    def __init__(self, config: PreprocessingConfig) -> None:
+        """
+        Initialize the DataPreprocessor.
 
         Args:
-            raw_data_dir: Path to the folder containing raw CSV files.
-            processed_data_dir: Path to the folder where processed data
-                will be written.
-            target_column: Name of the target column used for stratified
-                splitting and to exclude from scaling/encoding-as-feature
-                logic. If ``None`` or absent from the data, splitting
-                falls back to a non-stratified split.
-            test_size: Proportion of the dataset to include in the test
-                split.
-            random_state: Seed for reproducible results.
-
-        Raises:
-            ValueError: If ``test_size`` is not strictly between 0 and 1.
+            config: A PreprocessingConfig instance describing pipeline
+                behavior and file locations.
         """
-        if not 0.0 < test_size < 1.0:
-            raise ValueError("test_size must be between 0 and 1 (exclusive).")
-
-        self.raw_data_dir: Path = Path(raw_data_dir)
-        self.processed_data_dir: Path = Path(processed_data_dir)
-        self.target_column: Optional[str] = target_column
-        self.test_size: float = test_size
-        self.random_state: int = random_state
-
-        self.raw_data: Optional[pd.DataFrame] = None
-        self.processed_data: Optional[pd.DataFrame] = None
-        self.label_encoders: Dict[str, LabelEncoder] = {}
+        self.config = config
         self.scaler: Optional[StandardScaler] = None
+        self.label_encoder: Optional[LabelEncoder] = None
+        self._raw_df: Optional[pd.DataFrame] = None
 
-        logger.info(
-            "DataPreprocessor initialized (raw_dir=%s, processed_dir=%s, "
-            "target_column=%s, test_size=%.2f, random_state=%d)",
-            self.raw_data_dir,
-            self.processed_data_dir,
-            self.target_column,
-            self.test_size,
-            self.random_state,
-        )
+        logger.debug("DataPreprocessor initialized with config: %s", self.config)
 
-    # ------------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------------
-    def load_dataset(self) -> pd.DataFrame:
-        """Loads and merges every CSV file found under ``raw_data_dir``.
+    # ------------------------------------------------------------------- #
+    # Step 1: Load
+    # ------------------------------------------------------------------- #
+    def load_data(self) -> pd.DataFrame:
+        """
+        Load the raw dataset from the configured path.
 
-        Empty files are skipped. Corrupted or unreadable files are logged
-        and skipped rather than raising, so one bad file does not abort
-        the whole load.
+        Supports a single CSV file or a directory of CSV files, which are
+        concatenated into a single DataFrame (CICIDS2017 is often
+        distributed as multiple per-day CSV files).
 
         Returns:
-            The merged raw DataFrame, also stored in ``self.raw_data``.
+            The raw, unprocessed DataFrame.
 
         Raises:
-            FileNotFoundError: If ``raw_data_dir`` does not exist.
-            ValueError: If no valid CSV files could be loaded.
+            DataPreprocessingError: If the file/directory does not exist or
+                no CSV files could be read.
         """
-        if not self.raw_data_dir.exists():
-            raise FileNotFoundError(
-                f"Raw data directory not found: {self.raw_data_dir}"
-            )
+        path = self.config.raw_data_path
+        logger.info("Loading raw data from: %s", path)
 
-        csv_paths: List[Path] = sorted(self.raw_data_dir.glob("*.csv"))
-        if not csv_paths:
-            raise FileNotFoundError(
-                f"No CSV files found in raw data directory: {self.raw_data_dir}"
-            )
+        try:
+            if not path.exists():
+                raise DataPreprocessingError(f"Raw data path does not exist: {path}")
 
-        loaded_frames: List[pd.DataFrame] = []
-        loaded_files: List[str] = []
-
-        for csv_path in csv_paths:
-            try:
-                if csv_path.stat().st_size == 0:
-                    logger.warning("Skipping empty file: %s", csv_path.name)
-                    continue
-
-                frame = pd.read_csv(
-                    csv_path,
-                    low_memory=False,
-                    skipinitialspace=True,
-                    encoding="utf-8",
-                    on_bad_lines="warn",
-                )
-
-                if frame.empty:
-                    logger.warning(
-                        "Skipping file with no rows: %s", csv_path.name
+            if path.is_dir():
+                csv_files = sorted(path.glob("*.csv"))
+                if not csv_files:
+                    raise DataPreprocessingError(
+                        f"No CSV files found in directory: {path}"
                     )
-                    continue
+                logger.info("Found %d CSV file(s) to concatenate.", len(csv_files))
+                frames = [pd.read_csv(f, low_memory=False) for f in csv_files]
+                df = pd.concat(frames, ignore_index=True)
+            else:
+                df = pd.read_csv(path, low_memory=False)
 
-                loaded_frames.append(frame)
-                loaded_files.append(csv_path.name)
-
-            except pd.errors.EmptyDataError:
-                logger.warning("Skipping empty/unparseable file: %s", csv_path.name)
-                continue
-            except (pd.errors.ParserError, UnicodeDecodeError, OSError) as exc:
-                logger.error("Failed to load corrupted file %s: %s", csv_path.name, exc)
-                continue
-
-        if not loaded_frames:
-            raise ValueError(
-                f"No valid, non-empty CSV files could be loaded from "
-                f"{self.raw_data_dir}"
+            logger.info(
+                "Raw data loaded successfully. Shape: %s", df.shape
             )
+            self._raw_df = df
+            return df
 
-        try:
-            merged = pd.concat(loaded_frames, axis=0, ignore_index=True, sort=False)
-        except (ValueError, MemoryError) as exc:
-            raise ValueError(f"Failed to merge loaded CSV files: {exc}") from exc
-
-        self.raw_data = merged
-
-        logger.info("Dataset loaded")
-        logger.info("Files loaded (%d): %s", len(loaded_files), loaded_files)
-        logger.info("Dataset shape: %s", self.raw_data.shape)
-
-        return self.raw_data
-
-    # ------------------------------------------------------------------
-    # Inspection
-    # ------------------------------------------------------------------
-    def inspect_data(self) -> Dict[str, object]:
-        """Produces a summary report describing the loaded raw dataset.
-
-        Returns:
-            A dictionary with keys: ``shape``, ``columns``, ``dtypes``,
-            ``missing_values``, ``duplicate_count``, and
-            ``descriptive_statistics``.
-
-        Raises:
-            RuntimeError: If ``load_dataset`` has not been called yet.
-        """
-        if self.raw_data is None:
-            raise RuntimeError(
-                "No dataset loaded. Call load_dataset() before inspect_data()."
-            )
-
-        data = self.raw_data
-
-        report: Dict[str, object] = {
-            "shape": data.shape,
-            "columns": list(data.columns),
-            "dtypes": data.dtypes.astype(str).to_dict(),
-            "missing_values": data.isnull().sum().to_dict(),
-            "duplicate_count": int(data.duplicated().sum()),
-            "descriptive_statistics": data.describe(include="all").to_dict(),
-        }
-
-        logger.info("Data inspection complete: shape=%s, duplicates=%d",
-                     report["shape"], report["duplicate_count"])
-
-        return report
-
-    # ------------------------------------------------------------------
-    # Cleaning
-    # ------------------------------------------------------------------
-    def clean_data(self) -> pd.DataFrame:
-        """Cleans the raw dataset in place and stores the result.
-
-        Steps performed:
-            1. Strip whitespace from column names.
-            2. Remove completely empty columns.
-            3. Remove duplicate rows.
-            4. Replace +/-Infinity values with NaN.
-            5. Drop rows containing any NaN values.
-
-        Returns:
-            The cleaned DataFrame, also stored in ``self.processed_data``.
-
-        Raises:
-            RuntimeError: If ``load_dataset`` has not been called yet.
-        """
-        if self.raw_data is None:
-            raise RuntimeError(
-                "No dataset loaded. Call load_dataset() before clean_data()."
-            )
-
-        logger.info("Cleaning started")
-        data = self.raw_data.copy()
-
-        # Strip whitespace from column names.
-        data.columns = [str(col).strip() for col in data.columns]
-        logger.info("Column names stripped of surrounding whitespace")
-
-        # Remove completely empty columns.
-        empty_columns = data.columns[data.isnull().all()].tolist()
-        if empty_columns:
-            data = data.drop(columns=empty_columns)
-            logger.info("Removed %d completely empty columns: %s",
-                        len(empty_columns), empty_columns)
-        else:
-            logger.info("No completely empty columns found")
-
-        # Remove duplicate rows.
-        duplicates_before = int(data.duplicated().sum())
-        data = data.drop_duplicates()
-        logger.info("Removed %d duplicate rows", duplicates_before)
-
-        # Replace Infinity / -Infinity with NaN.
-        numeric_cols = data.select_dtypes(include=[np.number]).columns
-        inf_mask = data[numeric_cols].isin([np.inf, -np.inf])
-        inf_count = int(inf_mask.sum().sum())
-        data[numeric_cols] = data[numeric_cols].replace([np.inf, -np.inf], np.nan)
-        logger.info("Replaced %d Infinity/-Infinity values with NaN", inf_count)
-
-        # Remove rows containing NaN.
-        rows_before = len(data)
-        data = data.dropna(axis=0, how="any")
-        rows_dropped = rows_before - len(data)
-        logger.info("Dropped %d rows containing NaN values", rows_dropped)
-
-        data = data.reset_index(drop=True)
-        self.processed_data = data
-
-        logger.info("Cleaning completed. Final shape: %s", data.shape)
-
-        return self.processed_data
-
-    # ------------------------------------------------------------------
-    # Encoding
-    # ------------------------------------------------------------------
-    def encode_features(self) -> pd.DataFrame:
-        """Label-encodes categorical (non-numeric) feature columns.
-
-        The target column is skipped if it is already numeric. If the
-        target column is non-numeric, it is also label-encoded so that it
-        can be used for stratified splitting and model training, but its
-        encoder is still tracked separately in ``self.label_encoders``.
-
-        Returns:
-            The encoded DataFrame, stored in ``self.processed_data``.
-
-        Raises:
-            RuntimeError: If ``clean_data`` has not been called yet.
-        """
-        if self.processed_data is None:
-            raise RuntimeError(
-                "No cleaned dataset available. Call clean_data() before "
-                "encode_features()."
-            )
-
-        data = self.processed_data.copy()
-
-        categorical_columns = data.select_dtypes(
-            include=["object", "category"]
-        ).columns.tolist()
-
-        if not categorical_columns:
-            logger.info("No categorical columns detected; skipping encoding")
-            self.processed_data = data
-            logger.info("Encoding completed")
-            return self.processed_data
-
-        for column in categorical_columns:
-            try:
-                encoder = LabelEncoder()
-                data[column] = encoder.fit_transform(data[column].astype(str))
-                self.label_encoders[column] = encoder
-                logger.info(
-                    "Encoded categorical column '%s' (%d classes)",
-                    column,
-                    len(encoder.classes_),
-                )
-            except (ValueError, TypeError) as exc:
-                raise ValueError(
-                    f"Failed to encode categorical column '{column}': {exc}"
-                ) from exc
-
-        self.processed_data = data
-        logger.info("Encoding completed")
-
-        return self.processed_data
-
-    # ------------------------------------------------------------------
-    # Scaling
-    # ------------------------------------------------------------------
-    def scale_features(self) -> pd.DataFrame:
-        """Standard-scales numerical feature columns (excludes the target).
-
-        Returns:
-            The scaled DataFrame, stored in ``self.processed_data``.
-
-        Raises:
-            RuntimeError: If ``encode_features`` has not been called yet.
-        """
-        if self.processed_data is None:
-            raise RuntimeError(
-                "No encoded dataset available. Call encode_features() "
-                "before scale_features()."
-            )
-
-        data = self.processed_data.copy()
-
-        numerical_columns = data.select_dtypes(include=[np.number]).columns.tolist()
-        if self.target_column in numerical_columns:
-            numerical_columns.remove(self.target_column)
-
-        if not numerical_columns:
-            logger.info("No numerical feature columns detected; skipping scaling")
-            self.processed_data = data
-            logger.info("Scaling completed")
-            return self.processed_data
-
-        try:
-            self.scaler = StandardScaler()
-            data[numerical_columns] = self.scaler.fit_transform(data[numerical_columns])
-        except ValueError as exc:
-            raise ValueError(f"Failed to scale numerical features: {exc}") from exc
-
-        logger.info(
-            "Scaled %d numerical feature columns using StandardScaler",
-            len(numerical_columns),
-        )
-
-        self.processed_data = data
-        logger.info("Scaling completed")
-
-        return self.processed_data
-
-    # ------------------------------------------------------------------
-    # Splitting
-    # ------------------------------------------------------------------
-    def split_dataset(
-        self, data: Optional[pd.DataFrame] = None
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """Splits the processed dataset into train/test feature and label sets.
-
-        Args:
-            data: DataFrame to split. Defaults to ``self.processed_data``
-                if not provided.
-
-        Returns:
-            A tuple of ``(X_train, X_test, y_train, y_test)``.
-
-        Raises:
-            RuntimeError: If no data is available to split.
-            ValueError: If ``target_column`` is not present in the data.
-        """
-        frame = data if data is not None else self.processed_data
-        if frame is None:
-            raise RuntimeError(
-                "No processed dataset available. Run the pipeline before "
-                "split_dataset()."
-            )
-
-        if self.target_column is None or self.target_column not in frame.columns:
-            raise ValueError(
-                f"Target column '{self.target_column}' not found in dataset. "
-                f"Available columns: {list(frame.columns)}"
-            )
-
-        X = frame.drop(columns=[self.target_column])
-        y = frame[self.target_column]
-
-        stratify = y if y.nunique() > 1 else None
-
-        try:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X,
-                y,
-                test_size=self.test_size,
-                random_state=self.random_state,
-                stratify=stratify,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "Stratified split failed (%s); falling back to non-stratified split",
-                exc,
-            )
-            X_train, X_test, y_train, y_test = train_test_split(
-                X,
-                y,
-                test_size=self.test_size,
-                random_state=self.random_state,
-                stratify=None,
-            )
-
-        logger.info(
-            "Dataset split complete: X_train=%s, X_test=%s, y_train=%s, y_test=%s",
-            X_train.shape,
-            X_test.shape,
-            y_train.shape,
-            y_test.shape,
-        )
-
-        return X_train, X_test, y_train, y_test
-
-    # ------------------------------------------------------------------
-    # Saving
-    # ------------------------------------------------------------------
-    def save_processed_data(self, filename: str = "processed_dataset.csv") -> Path:
-        """Saves the processed dataset to ``processed_data_dir``.
-
-        Creates the output directory automatically if it does not exist.
-
-        Args:
-            filename: Name of the output CSV file.
-
-        Returns:
-            The full path to the saved file.
-
-        Raises:
-            RuntimeError: If there is no processed data to save.
-            OSError: If the file could not be written.
-        """
-        if self.processed_data is None:
-            raise RuntimeError(
-                "No processed dataset available. Run the pipeline before "
-                "save_processed_data()."
-            )
-
-        try:
-            self.processed_data_dir.mkdir(parents=True, exist_ok=True)
+        except pd.errors.EmptyDataError as exc:
+            logger.error("The provided CSV file is empty.")
+            raise DataPreprocessingError("The provided CSV file is empty.") from exc
+        except pd.errors.ParserError as exc:
+            logger.error("Failed to parse CSV file: %s", exc)
+            raise DataPreprocessingError(f"Failed to parse CSV file: {exc}") from exc
         except OSError as exc:
-            raise OSError(
-                f"Failed to create processed data directory "
-                f"{self.processed_data_dir}: {exc}"
+            logger.error("OS error while reading raw data: %s", exc)
+            raise DataPreprocessingError(
+                f"OS error while reading raw data: {exc}"
             ) from exc
 
-        output_path = self.processed_data_dir / filename
+    # ------------------------------------------------------------------- #
+    # Step 2: Validate
+    # ------------------------------------------------------------------- #
+    def validate_data(self, df: pd.DataFrame) -> None:
+        """
+        Validate that the loaded DataFrame meets minimum structural
+        requirements before processing continues.
 
-        try:
-            self.processed_data.to_csv(output_path, index=False)
-        except OSError as exc:
-            raise OSError(f"Failed to save processed dataset: {exc}") from exc
-
-        logger.info("Saving completed. Processed data written to: %s", output_path)
-
-        return output_path
-
-    # ------------------------------------------------------------------
-    # Pipeline orchestration
-    # ------------------------------------------------------------------
-    def run_pipeline(self) -> pd.DataFrame:
-        """Runs the full preprocessing pipeline end to end.
-
-        Order: load_dataset -> inspect_data -> clean_data ->
-        encode_features -> scale_features -> save_processed_data.
-
-        Returns:
-            The final processed DataFrame.
+        Args:
+            df: The raw or partially processed DataFrame to validate.
 
         Raises:
-            Exception: Propagates any exception raised by pipeline steps,
-                after logging the failure.
+            DataValidationError: If the DataFrame is empty or the target
+                column cannot be located (case-insensitive, whitespace
+                tolerant).
+        """
+        logger.info("Validating dataset structure.")
+
+        if df.empty:
+            raise DataValidationError("Loaded dataset is empty.")
+
+        normalized_cols = {c.strip().lower(): c for c in df.columns}
+        target_key = self.config.target_column.strip().lower()
+
+        if target_key not in normalized_cols:
+            raise DataValidationError(
+                f"Target column '{self.config.target_column}' not found in "
+                f"dataset columns: {list(df.columns)}"
+            )
+
+        # Resolve to the actual column name present in the DataFrame.
+        actual_target_name = normalized_cols[target_key]
+        if actual_target_name != self.config.target_column:
+            logger.warning(
+                "Target column resolved as '%s' (config specified '%s').",
+                actual_target_name,
+                self.config.target_column,
+            )
+            self.config.target_column = actual_target_name
+
+        logger.info("Dataset validation passed. Shape: %s", df.shape)
+
+    # ------------------------------------------------------------------- #
+    # Step 3: Clean column names
+    # ------------------------------------------------------------------- #
+    @staticmethod
+    def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Strip leading/trailing whitespace from column names, a common
+        artifact in the CICIDS2017 CSV exports.
+
+        Args:
+            df: DataFrame whose columns require normalization.
+
+        Returns:
+            DataFrame with cleaned column names.
+        """
+        df = df.copy()
+        df.columns = [str(col).strip() for col in df.columns]
+        logger.debug("Column names normalized.")
+        return df
+
+    # ------------------------------------------------------------------- #
+    # Step 4: Drop non-informative columns
+    # ------------------------------------------------------------------- #
+    def drop_irrelevant_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Remove identifier and non-informative columns (e.g., Flow ID, IP
+        addresses, timestamps) that provide no generalizable predictive
+        signal and risk leaking identity information into the model.
+
+        Args:
+            df: DataFrame from which columns will be dropped.
+
+        Returns:
+            DataFrame with irrelevant columns removed.
+        """
+        cols_present = [c for c in self.config.columns_to_drop if c in df.columns]
+        if cols_present:
+            logger.info("Dropping irrelevant columns: %s", cols_present)
+            df = df.drop(columns=cols_present)
+        else:
+            logger.info("No configured irrelevant columns found in dataset.")
+        return df
+
+    # ------------------------------------------------------------------- #
+    # Step 5 & 6: Handle infinities and missing values
+    # ------------------------------------------------------------------- #
+    def handle_missing_and_infinite(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Replace infinite values with NaN, then impute or drop missing
+        values. Numeric columns are imputed with the column median;
+        rows still containing missing values after imputation (e.g., in
+        non-numeric columns) are dropped.
+
+        Args:
+            df: DataFrame to clean.
+
+        Returns:
+            DataFrame free of infinite and missing values.
+
+        Raises:
+            DataPreprocessingError: If cleaning results in an empty
+                DataFrame.
+        """
+        logger.info("Handling infinite and missing values.")
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        initial_shape = df.shape
+
+        df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+
+        total_missing_before = int(df.isna().sum().sum())
+        logger.info("Total missing/infinite cells detected: %d", total_missing_before)
+
+        if total_missing_before > 0:
+            for col in numeric_cols:
+                if df[col].isna().any():
+                    median_val = df[col].median()
+                    df[col] = df[col].fillna(median_val)
+                    logger.debug(
+                        "Filled NaNs in column '%s' with median value %.4f",
+                        col,
+                        median_val,
+                    )
+
+        remaining_na = df.isna().sum().sum()
+        if remaining_na > 0:
+            logger.warning(
+                "%d missing values remain in non-numeric columns; dropping "
+                "affected rows.",
+                remaining_na,
+            )
+            df = df.dropna()
+
+        if df.empty:
+            raise DataPreprocessingError(
+                "Dataset became empty after handling missing/infinite values."
+            )
+
+        logger.info(
+            "Missing/infinite value handling complete. Shape before: %s, after: %s",
+            initial_shape,
+            df.shape,
+        )
+        return df
+
+    # ------------------------------------------------------------------- #
+    # Step 7: Deduplicate
+    # ------------------------------------------------------------------- #
+    def remove_duplicates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Remove exact duplicate rows from the dataset, if configured to do
+        so.
+
+        Args:
+            df: DataFrame to deduplicate.
+
+        Returns:
+            Deduplicated DataFrame (or the original if disabled).
+        """
+        if not self.config.drop_duplicates:
+            logger.info("Duplicate removal disabled via config; skipping.")
+            return df
+
+        before = len(df)
+        df = df.drop_duplicates()
+        removed = before - len(df)
+        logger.info("Removed %d duplicate row(s). New shape: %s", removed, df.shape)
+        return df
+
+    # ------------------------------------------------------------------- #
+    # Step 8: Encode target label
+    # ------------------------------------------------------------------- #
+    def encode_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fit a LabelEncoder on the target column and replace its values
+        with integer-encoded classes.
+
+        Args:
+            df: DataFrame containing the raw (string) target column.
+
+        Returns:
+            DataFrame with the target column encoded as integers.
+
+        Raises:
+            DataPreprocessingError: If label encoding fails.
+        """
+        target = self.config.target_column
+        logger.info("Encoding target column: '%s'", target)
+
+        try:
+            df[target] = df[target].astype(str).str.strip()
+            self.label_encoder = LabelEncoder()
+            df[target] = self.label_encoder.fit_transform(df[target])
+
+            mapping = dict(
+                zip(
+                    self.label_encoder.classes_,
+                    self.label_encoder.transform(self.label_encoder.classes_),
+                )
+            )
+            logger.info("Label encoding mapping: %s", mapping)
+            return df
+
+        except (ValueError, TypeError) as exc:
+            logger.error("Failed to encode target labels: %s", exc)
+            raise DataPreprocessingError(
+                f"Failed to encode target labels: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 9: Split
+    # ------------------------------------------------------------------- #
+    def split_features_target(
+        self, df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """
+        Split the DataFrame into train/test feature matrices and target
+        vectors.
+
+        Args:
+            df: Fully cleaned and encoded DataFrame.
+
+        Returns:
+            A tuple of (X_train, X_test, y_train, y_test).
+
+        Raises:
+            DataPreprocessingError: If the split operation fails.
+        """
+        target = self.config.target_column
+        logger.info(
+            "Splitting data into train/test sets (test_size=%.2f, stratify=%s).",
+            self.config.test_size,
+            self.config.stratify,
+        )
+
+        try:
+            X = df.drop(columns=[target])
+            y = df[target]
+
+            # Retain only numeric feature columns for modeling.
+            non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
+            if non_numeric:
+                logger.warning(
+                    "Dropping non-numeric feature columns prior to split: %s",
+                    non_numeric,
+                )
+                X = X.drop(columns=non_numeric)
+
+            stratify_arg = y if self.config.stratify else None
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=self.config.test_size,
+                random_state=self.config.random_state,
+                stratify=stratify_arg,
+            )
+
+            logger.info(
+                "Split complete. X_train: %s, X_test: %s",
+                X_train.shape,
+                X_test.shape,
+            )
+            return X_train, X_test, y_train, y_test
+
+        except ValueError as exc:
+            logger.error("Train/test split failed: %s", exc)
+            raise DataPreprocessingError(f"Train/test split failed: {exc}") from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 10: Scale
+    # ------------------------------------------------------------------- #
+    def scale_features(
+        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Fit a StandardScaler on the training features and apply it to both
+        the training and test sets, preserving column names and indices.
+
+        Args:
+            X_train: Training feature matrix.
+            X_test: Test feature matrix.
+
+        Returns:
+            Tuple of (X_train_scaled, X_test_scaled) as DataFrames.
+        """
+        if not self.config.scale_features:
+            logger.info("Feature scaling disabled via config; skipping.")
+            return X_train, X_test
+
+        logger.info("Scaling numeric features using StandardScaler.")
+        try:
+            self.scaler = StandardScaler()
+            X_train_scaled = pd.DataFrame(
+                self.scaler.fit_transform(X_train),
+                columns=X_train.columns,
+                index=X_train.index,
+            )
+            X_test_scaled = pd.DataFrame(
+                self.scaler.transform(X_test),
+                columns=X_test.columns,
+                index=X_test.index,
+            )
+            logger.info("Feature scaling complete.")
+            return X_train_scaled, X_test_scaled
+
+        except ValueError as exc:
+            logger.error("Feature scaling failed: %s", exc)
+            raise DataPreprocessingError(f"Feature scaling failed: {exc}") from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 11: Persist
+    # ------------------------------------------------------------------- #
+    def save_artifacts(
+        self,
+        X_train: pd.DataFrame,
+        X_test: pd.DataFrame,
+        y_train: pd.Series,
+        y_test: pd.Series,
+    ) -> None:
+        """
+        Persist processed datasets to the processed data directory and
+        fitted transformation artifacts (scaler, label encoder) to the
+        models directory.
+
+        Args:
+            X_train: Scaled/processed training features.
+            X_test: Scaled/processed test features.
+            y_train: Encoded training target.
+            y_test: Encoded test target.
+
+        Raises:
+            DataPreprocessingError: If saving any artifact fails.
         """
         try:
-            self.load_dataset()
-            self.inspect_data()
-            self.clean_data()
-            self.encode_features()
-            self.scale_features()
-            self.save_processed_data()
+            self.config.processed_data_dir.mkdir(parents=True, exist_ok=True)
+            self.config.models_dir.mkdir(parents=True, exist_ok=True)
 
-            logger.info("Pipeline completed successfully")
+            X_train.to_csv(
+                self.config.processed_data_dir / "X_train.csv", index=False
+            )
+            X_test.to_csv(self.config.processed_data_dir / "X_test.csv", index=False)
+            y_train.to_csv(
+                self.config.processed_data_dir / "y_train.csv", index=False
+            )
+            y_test.to_csv(self.config.processed_data_dir / "y_test.csv", index=False)
 
-            return self.processed_data
+            pd.Series(X_train.columns, name="feature").to_csv(
+                self.config.models_dir / "selected_features.csv", index=False
+            )
 
-        except Exception:
-            logger.exception("Pipeline execution failed")
-            raise
+            if self.scaler is not None:
+                joblib.dump(self.scaler, self.config.models_dir / "scaler.pkl")
+                logger.info("Scaler artifact saved.")
+
+            if self.label_encoder is not None:
+                joblib.dump(
+                    self.label_encoder,
+                    self.config.models_dir / "label_encoder.pkl",
+                )
+                logger.info("Label encoder artifact saved.")
+
+            logger.info(
+                "All processed datasets and artifacts saved to '%s' and '%s'.",
+                self.config.processed_data_dir,
+                self.config.models_dir,
+            )
+
+        except OSError as exc:
+            logger.error("Failed to save preprocessing artifacts: %s", exc)
+            raise DataPreprocessingError(
+                f"Failed to save preprocessing artifacts: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------- #
+    # Orchestrator
+    # ------------------------------------------------------------------- #
+    def run(
+        self, persist: bool = True
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """
+        Execute the full preprocessing pipeline end-to-end.
+
+        Args:
+            persist: If True, saves processed datasets and fitted
+                artifacts to disk. Set to False for in-memory/testing use.
+
+        Returns:
+            A tuple of (X_train, X_test, y_train, y_test) ready for model
+            training.
+
+        Raises:
+            DataPreprocessingError: Propagated from any pipeline stage on
+                unrecoverable failure.
+        """
+        logger.info("=== Starting data preprocessing pipeline ===")
+
+        df = self.load_data()
+        df = self.clean_column_names(df)
+        self.validate_data(df)
+        df = self.drop_irrelevant_columns(df)
+        df = self.handle_missing_and_infinite(df)
+        df = self.remove_duplicates(df)
+        df = self.encode_labels(df)
+
+        X_train, X_test, y_train, y_test = self.split_features_target(df)
+        X_train, X_test = self.scale_features(X_train, X_test)
+
+        if persist:
+            self.save_artifacts(X_train, X_test, y_train, y_test)
+
+        logger.info("=== Data preprocessing pipeline completed successfully ===")
+        return X_train, X_test, y_train, y_test
+
+
+# --------------------------------------------------------------------------- #
+# CLI Entry Point
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    """
+    Command-line entry point for running the preprocessing pipeline
+    standalone, e.g.:
+
+        python -m src.data.data_preprocessing --raw-data data/raw/cicids2017.csv
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Preprocess the CICIDS2017 network intrusion dataset."
+    )
+    parser.add_argument(
+        "--raw-data",
+        type=str,
+        required=True,
+        help="Path to the raw CICIDS2017 CSV file or directory of CSV files.",
+    )
+    parser.add_argument(
+        "--target-column",
+        type=str,
+        default="Label",
+        help="Name of the target/label column in the dataset.",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help="Proportion of the dataset to reserve for testing.",
+    )
+    args = parser.parse_args()
+
+    try:
+        config = PreprocessingConfig(
+            raw_data_path=Path(args.raw_data),
+            target_column=args.target_column,
+            test_size=args.test_size,
+        )
+        preprocessor = DataPreprocessor(config)
+        preprocessor.run(persist=True)
+    except DataPreprocessingError as exc:
+        logger.critical("Preprocessing pipeline failed: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    pipeline = DataPreprocessor(
-        raw_data_dir="data/raw",
-        processed_data_dir="data/processed",
-        target_column="Label",
-    )
-    final_df = pipeline.run_pipeline()
-    X_train, X_test, y_train, y_test = pipeline.split_dataset(final_df)
+    main()

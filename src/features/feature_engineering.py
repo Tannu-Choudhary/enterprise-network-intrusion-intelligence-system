@@ -1,410 +1,595 @@
-"""Feature engineering pipeline for the CIC-IDS2017 network intrusion dataset.
+"""
+feature_engineering.py
+========================
 
-This module provides the ``FeatureEngineer`` class, which encapsulates the
-full feature engineering workflow used by the Enterprise Network Intrusion
-Intelligence System: irrelevant column removal, numerical feature selection,
-correlation analysis, redundant feature pruning, tree-based feature
-importance ranking, and persistence of the final selected feature set.
+Feature engineering pipeline for the Enterprise Network Intrusion
+Intelligence System. This module consumes the cleaned/encoded output of
+``src.data.data_preprocessing`` and performs feature-space refinement:
+low-variance filtering, correlation-based redundancy removal, model-based
+feature importance ranking, optional dimensionality reduction, and
+persistence of the final selected feature set for use by the training and
+inference pipelines.
+
+Dataset reference:
+    https://www.kaggle.com/datasets/ericanacletoribeiro/cicids2017-cleaned-and-preprocessed
+
+Author: Member A - Enterprise Network Intrusion Intelligence System
+Python Version: 3.11
 """
 
-import logging
-from pathlib import Path
-from typing import List, Optional, Tuple
+from __future__ import annotations
 
+import logging
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import VarianceThreshold
 
+# --------------------------------------------------------------------------- #
+# Logging Configuration
+# --------------------------------------------------------------------------- #
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _formatter = logging.Formatter(
-        fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    logger.setLevel(logging.INFO)
+    _console_handler = logging.StreamHandler(sys.stdout)
+    _console_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
-    _handler.setFormatter(_formatter)
-    logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+    logger.addHandler(_console_handler)
 
 
-class FeatureEngineer:
-    """Performs feature engineering for the CIC-IDS2017 intrusion dataset.
+# --------------------------------------------------------------------------- #
+# Custom Exceptions
+# --------------------------------------------------------------------------- #
+class FeatureEngineeringError(Exception):
+    """Raised when an unrecoverable error occurs during feature engineering."""
 
-    The pipeline removes irrelevant identifier columns, isolates numerical
-    features, analyzes and prunes highly correlated features, computes
-    feature importance using a Random Forest classifier, selects the top
-    features, and persists the final feature list to disk.
+
+class FeatureValidationError(FeatureEngineeringError):
+    """Raised when input data fails validation prior to feature engineering."""
+
+
+# --------------------------------------------------------------------------- #
+# Configuration Dataclass
+# --------------------------------------------------------------------------- #
+@dataclass
+class FeatureEngineeringConfig:
+    """
+    Configuration container for the feature engineering pipeline.
 
     Attributes:
-        correlation_threshold: Pearson correlation threshold above which one
-            of a pair of features is dropped.
-        top_n_features: Number of top-ranked features to retain.
-        irrelevant_columns: Column names considered irrelevant and removed
-            prior to analysis.
-        output_path: Destination path for the saved selected feature list.
-        selected_features_: List of final selected feature names, populated
-            after ``run_pipeline`` (or the individual steps) has executed.
-        correlation_matrix_: Pearson correlation matrix computed during the
-            correlation analysis step.
-        feature_importances_: Series of feature importances computed by the
-            Random Forest classifier.
+        processed_data_dir: Directory containing X_train.csv / X_test.csv /
+            y_train.csv / y_test.csv produced by the preprocessing stage.
+        models_dir: Directory where feature-engineering artifacts
+            (selected_features.csv, PCA transformer) are persisted.
+        variance_threshold: Minimum variance a feature must have to be
+            retained. Features at or below this threshold are dropped as
+            near-constant / non-informative.
+        correlation_threshold: Absolute Pearson correlation above which one
+            of a pair of features is considered redundant and dropped.
+        top_k_features: Number of top features to retain based on
+            Random Forest feature importance ranking. If None, all
+            surviving features (after variance/correlation filtering) are
+            kept.
+        apply_pca: Whether to additionally fit a PCA transformer on the
+            selected features for optional dimensionality reduction
+            (persisted separately; does not replace the selected feature
+            set by default).
+        pca_variance_ratio: Target cumulative explained variance ratio used
+            to determine the number of PCA components when apply_pca=True.
+        random_state: Seed for reproducibility in the Random Forest
+            importance estimator and PCA.
+        n_estimators: Number of trees used by the Random Forest importance
+            estimator.
     """
 
-    DEFAULT_IRRELEVANT_COLUMNS: List[str] = [
-        "Flow ID",
-        "Source IP",
-        "Destination IP",
-        "Timestamp",
-    ]
+    processed_data_dir: Path = Path("data/processed")
+    models_dir: Path = Path("models")
+    variance_threshold: float = 0.0
+    correlation_threshold: float = 0.95
+    top_k_features: Optional[int] = 30
+    apply_pca: bool = False
+    pca_variance_ratio: float = 0.95
+    random_state: int = 42
+    n_estimators: int = 100
+    _reserved: list[str] = field(default_factory=list)
 
-    def __init__(
-        self,
-        correlation_threshold: float = 0.95,
-        top_n_features: int = 30,
-        irrelevant_columns: Optional[List[str]] = None,
-        output_path: str = "data/processed/selected_features.csv",
-        random_state: int = 42,
-    ) -> None:
-        """Initializes the FeatureEngineer.
+
+# --------------------------------------------------------------------------- #
+# Core Feature Engineering Class
+# --------------------------------------------------------------------------- #
+class FeatureEngineer:
+    """
+    Encapsulates feature selection and transformation logic for the
+    intrusion detection feature space.
+
+    Pipeline stages:
+        1. Load processed train/test splits from disk.
+        2. Validate structural integrity.
+        3. Remove low/zero-variance features.
+        4. Remove highly correlated redundant features.
+        5. Rank remaining features by Random Forest importance and select
+           the top-k.
+        6. Optionally fit a PCA transformer for dimensionality reduction.
+        7. Persist the final selected feature list and any fitted
+           transformers.
+
+    Example:
+        >>> config = FeatureEngineeringConfig()
+        >>> engineer = FeatureEngineer(config)
+        >>> X_train_fe, X_test_fe = engineer.run()
+    """
+
+    def __init__(self, config: FeatureEngineeringConfig) -> None:
+        """
+        Initialize the FeatureEngineer.
 
         Args:
-            correlation_threshold: Pearson correlation threshold (0-1) above
-                which one feature of a correlated pair is dropped.
-            top_n_features: Number of top important features to select.
-            irrelevant_columns: Optional list of column names to drop before
-                analysis. Defaults to the standard CIC-IDS2017 identifier
-                columns (Flow ID, Source IP, Destination IP, Timestamp).
-            output_path: File path where selected feature names are saved.
-            random_state: Random seed for reproducibility of the Random
-                Forest classifier.
-
-        Raises:
-            ValueError: If ``correlation_threshold`` is not within (0, 1] or
-                ``top_n_features`` is not a positive integer.
+            config: A FeatureEngineeringConfig instance describing
+                pipeline behavior and file locations.
         """
-        if not 0.0 < correlation_threshold <= 1.0:
-            raise ValueError("correlation_threshold must be within (0, 1].")
-        if top_n_features <= 0:
-            raise ValueError("top_n_features must be a positive integer.")
-
-        self.correlation_threshold = correlation_threshold
-        self.top_n_features = top_n_features
-        self.irrelevant_columns = (
-            irrelevant_columns
-            if irrelevant_columns is not None
-            else list(self.DEFAULT_IRRELEVANT_COLUMNS)
-        )
-        self.output_path = Path(output_path)
-        self.random_state = random_state
-
-        self.selected_features_: List[str] = []
-        self.correlation_matrix_: Optional[pd.DataFrame] = None
+        self.config = config
+        self.selected_features_: list[str] = []
         self.feature_importances_: Optional[pd.Series] = None
+        self.pca_: Optional[PCA] = None
 
-        logger.info(
-            "FeatureEngineer initialized (correlation_threshold=%.2f, "
-            "top_n_features=%d, output_path=%s)",
-            self.correlation_threshold,
-            self.top_n_features,
-            self.output_path,
-        )
+        logger.debug("FeatureEngineer initialized with config: %s", self.config)
 
-    def remove_irrelevant_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Removes known irrelevant identifier columns from the dataframe.
-
-        Args:
-            df: Input dataframe, typically the raw CIC-IDS2017 dataset.
+    # ------------------------------------------------------------------- #
+    # Step 1: Load
+    # ------------------------------------------------------------------- #
+    def load_processed_data(
+        self,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """
+        Load the processed train/test splits produced by the preprocessing
+        stage.
 
         Returns:
-            A new dataframe with irrelevant columns removed, if present.
+            Tuple of (X_train, X_test, y_train, y_test).
 
         Raises:
-            TypeError: If ``df`` is not a pandas DataFrame.
+            FeatureEngineeringError: If any required file is missing or
+                cannot be parsed.
         """
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input 'df' must be a pandas DataFrame.")
+        directory = self.config.processed_data_dir
+        logger.info("Loading processed data from: %s", directory)
 
-        columns_to_drop = [col for col in self.irrelevant_columns if col in df.columns]
-        if columns_to_drop:
-            logger.info("Removing irrelevant columns: %s", columns_to_drop)
-            df = df.drop(columns=columns_to_drop)
-        else:
-            logger.info("No irrelevant columns found to remove.")
-
-        return df
-
-    def select_numerical_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Selects numerical columns from the dataframe.
-
-        Args:
-            df: Input dataframe.
-
-        Returns:
-            A dataframe containing only numerical columns.
-
-        Raises:
-            TypeError: If ``df`` is not a pandas DataFrame.
-            ValueError: If no numerical columns are found.
-        """
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input 'df' must be a pandas DataFrame.")
-
-        numerical_df = df.select_dtypes(include=[np.number])
-
-        if numerical_df.empty:
-            raise ValueError("No numerical columns found in the dataframe.")
-
-        logger.info(
-            "Selected %d numerical columns out of %d total columns.",
-            numerical_df.shape[1],
-            df.shape[1],
-        )
-        return numerical_df
-
-    def correlation_analysis(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Computes the Pearson correlation matrix for numerical features.
-
-        Args:
-            df: Dataframe containing numerical features.
-
-        Returns:
-            The absolute-value Pearson correlation matrix.
-
-        Raises:
-            TypeError: If ``df`` is not a pandas DataFrame.
-            ValueError: If the dataframe is empty.
-        """
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input 'df' must be a pandas DataFrame.")
-        if df.empty:
-            raise ValueError("Cannot compute correlation on an empty dataframe.")
-
-        logger.info("Computing Pearson correlation matrix on %d features.", df.shape[1])
-        corr_matrix = df.corr(method="pearson").abs()
-        self.correlation_matrix_ = corr_matrix
-
-        return corr_matrix
-
-    def remove_highly_correlated_features(
-        self, df: pd.DataFrame, corr_matrix: Optional[pd.DataFrame] = None
-    ) -> pd.DataFrame:
-        """Removes one feature from each pair with correlation above threshold.
-
-        Args:
-            df: Dataframe containing numerical features.
-            corr_matrix: Optional precomputed correlation matrix. If not
-                provided, it is computed from ``df``.
-
-        Returns:
-            A dataframe with highly correlated features removed.
-
-        Raises:
-            TypeError: If ``df`` is not a pandas DataFrame.
-        """
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input 'df' must be a pandas DataFrame.")
-
-        if corr_matrix is None:
-            corr_matrix = self.correlation_analysis(df)
-
-        upper_triangle = corr_matrix.where(
-            np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-        )
-
-        to_drop = [
-            column
-            for column in upper_triangle.columns
-            if any(upper_triangle[column] > self.correlation_threshold)
-        ]
-
-        logger.info(
-            "Dropping %d highly correlated features (threshold=%.2f): %s",
-            len(to_drop),
-            self.correlation_threshold,
-            to_drop,
-        )
-
-        reduced_df = df.drop(columns=to_drop, errors="ignore")
-        logger.info(
-            "Feature count reduced from %d to %d after correlation pruning.",
-            df.shape[1],
-            reduced_df.shape[1],
-        )
-
-        return reduced_df
-
-    def feature_importance(
-        self, X: pd.DataFrame, y: pd.Series
-    ) -> pd.Series:
-        """Computes feature importance using a RandomForestClassifier.
-
-        Args:
-            X: Feature matrix (numerical, cleaned).
-            y: Target labels corresponding to ``X``.
-
-        Returns:
-            A pandas Series of feature importances indexed by feature name,
-            sorted in descending order.
-
-        Raises:
-            TypeError: If ``X`` is not a DataFrame or ``y`` is not a Series.
-            ValueError: If ``X`` and ``y`` have mismatched lengths, or ``X``
-                is empty.
-        """
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("Input 'X' must be a pandas DataFrame.")
-        if not isinstance(y, pd.Series):
-            raise TypeError("Input 'y' must be a pandas Series.")
-        if X.empty:
-            raise ValueError("Feature matrix 'X' is empty.")
-        if len(X) != len(y):
-            raise ValueError("'X' and 'y' must have the same number of rows.")
-
-        logger.info(
-            "Training RandomForestClassifier for feature importance on %d "
-            "samples and %d features.",
-            X.shape[0],
-            X.shape[1],
-        )
+        required_files = ["X_train.csv", "X_test.csv", "y_train.csv", "y_test.csv"]
+        missing = [f for f in required_files if not (directory / f).exists()]
+        if missing:
+            raise FeatureEngineeringError(
+                f"Missing required processed data file(s): {missing} in {directory}"
+            )
 
         try:
-            clf = RandomForestClassifier(
-                n_estimators=200,
-                random_state=self.random_state,
+            X_train = pd.read_csv(directory / "X_train.csv")
+            X_test = pd.read_csv(directory / "X_test.csv")
+            y_train = pd.read_csv(directory / "y_train.csv").squeeze("columns")
+            y_test = pd.read_csv(directory / "y_test.csv").squeeze("columns")
+
+            logger.info(
+                "Processed data loaded. X_train: %s, X_test: %s",
+                X_train.shape,
+                X_test.shape,
+            )
+            return X_train, X_test, y_train, y_test
+
+        except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+            logger.error("Failed to parse processed data files: %s", exc)
+            raise FeatureEngineeringError(
+                f"Failed to parse processed data files: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 2: Validate
+    # ------------------------------------------------------------------- #
+    @staticmethod
+    def validate_inputs(X_train: pd.DataFrame, y_train: pd.Series) -> None:
+        """
+        Validate that feature and target data are non-empty, aligned, and
+        numeric.
+
+        Args:
+            X_train: Training feature matrix.
+            y_train: Training target vector.
+
+        Raises:
+            FeatureValidationError: If validation fails.
+        """
+        logger.info("Validating feature engineering inputs.")
+
+        if X_train.empty:
+            raise FeatureValidationError("X_train is empty.")
+
+        if len(X_train) != len(y_train):
+            raise FeatureValidationError(
+                f"Row count mismatch: X_train has {len(X_train)} rows, "
+                f"y_train has {len(y_train)} rows."
+            )
+
+        non_numeric = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
+        if non_numeric:
+            raise FeatureValidationError(
+                f"X_train contains non-numeric columns: {non_numeric}"
+            )
+
+        logger.info("Input validation passed.")
+
+    # ------------------------------------------------------------------- #
+    # Step 3: Variance filtering
+    # ------------------------------------------------------------------- #
+    def remove_low_variance_features(
+        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Remove features whose variance is at or below the configured
+        threshold, as they carry little to no discriminative signal.
+
+        Args:
+            X_train: Training feature matrix.
+            X_test: Test feature matrix.
+
+        Returns:
+            Tuple of (X_train, X_test) with low-variance columns removed.
+
+        Raises:
+            FeatureEngineeringError: If variance filtering removes all
+                features.
+        """
+        logger.info(
+            "Applying variance threshold filtering (threshold=%.4f).",
+            self.config.variance_threshold,
+        )
+        try:
+            selector = VarianceThreshold(threshold=self.config.variance_threshold)
+            selector.fit(X_train)
+
+            retained_mask = selector.get_support()
+            retained_cols = X_train.columns[retained_mask].tolist()
+            dropped_cols = X_train.columns[~retained_mask].tolist()
+
+            if dropped_cols:
+                logger.info(
+                    "Dropped %d low-variance feature(s): %s",
+                    len(dropped_cols),
+                    dropped_cols,
+                )
+
+            if not retained_cols:
+                raise FeatureEngineeringError(
+                    "All features were removed by variance thresholding; "
+                    "consider lowering variance_threshold."
+                )
+
+            return X_train[retained_cols], X_test[retained_cols]
+
+        except ValueError as exc:
+            logger.error("Variance filtering failed: %s", exc)
+            raise FeatureEngineeringError(f"Variance filtering failed: {exc}") from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 4: Correlation filtering
+    # ------------------------------------------------------------------- #
+    def remove_correlated_features(
+        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Identify pairs of features with absolute Pearson correlation above
+        the configured threshold and drop one feature from each redundant
+        pair, retaining the first-encountered column.
+
+        Args:
+            X_train: Training feature matrix.
+            X_test: Test feature matrix.
+
+        Returns:
+            Tuple of (X_train, X_test) with redundant columns removed.
+        """
+        logger.info(
+            "Removing highly correlated features (threshold=%.2f).",
+            self.config.correlation_threshold,
+        )
+        try:
+            corr_matrix = X_train.corr().abs()
+            upper_triangle = corr_matrix.where(
+                np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+            )
+
+            to_drop = [
+                column
+                for column in upper_triangle.columns
+                if any(upper_triangle[column] > self.config.correlation_threshold)
+            ]
+
+            if to_drop:
+                logger.info(
+                    "Dropped %d redundant correlated feature(s): %s",
+                    len(to_drop),
+                    to_drop,
+                )
+                X_train = X_train.drop(columns=to_drop)
+                X_test = X_test.drop(columns=to_drop)
+            else:
+                logger.info("No redundant correlated features found.")
+
+            return X_train, X_test
+
+        except Exception as exc:  # noqa: BLE001 - guard against unexpected corr issues
+            logger.error("Correlation filtering failed: %s", exc)
+            raise FeatureEngineeringError(
+                f"Correlation filtering failed: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 5: Importance-based selection
+    # ------------------------------------------------------------------- #
+    def select_top_features_by_importance(
+        self,
+        X_train: pd.DataFrame,
+        X_test: pd.DataFrame,
+        y_train: pd.Series,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Rank remaining features using a Random Forest classifier's
+        impurity-based feature importances and retain the top-k features.
+
+        Args:
+            X_train: Training feature matrix (post variance/correlation
+                filtering).
+            X_test: Test feature matrix (post variance/correlation
+                filtering).
+            y_train: Encoded training target vector.
+
+        Returns:
+            Tuple of (X_train, X_test) restricted to the top-k most
+            important features. If ``top_k_features`` is None or exceeds
+            the number of available features, all features are retained.
+
+        Raises:
+            FeatureEngineeringError: If the importance model fails to fit.
+        """
+        logger.info("Ranking features by Random Forest importance.")
+        try:
+            rf = RandomForestClassifier(
+                n_estimators=self.config.n_estimators,
+                random_state=self.config.random_state,
                 n_jobs=-1,
             )
-            clf.fit(X, y)
-        except Exception as exc:
-            logger.error("RandomForestClassifier training failed: %s", exc)
-            raise
+            rf.fit(X_train, y_train)
 
-        importances = pd.Series(
-            clf.feature_importances_, index=X.columns
-        ).sort_values(ascending=False)
+            importances = pd.Series(
+                rf.feature_importances_, index=X_train.columns
+            ).sort_values(ascending=False)
+            self.feature_importances_ = importances
 
-        self.feature_importances_ = importances
-        logger.info("Feature importance computation complete.")
-
-        return importances
-
-    def select_top_features(
-        self, importances: Optional[pd.Series] = None
-    ) -> List[str]:
-        """Selects the top N most important features.
-
-        Args:
-            importances: Optional precomputed feature importance Series. If
-                not provided, uses ``self.feature_importances_`` computed by
-                a prior call to ``feature_importance``.
-
-        Returns:
-            A list of the top ``top_n_features`` feature names, ordered by
-            descending importance.
-
-        Raises:
-            ValueError: If no feature importances are available.
-        """
-        if importances is None:
-            importances = self.feature_importances_
-
-        if importances is None:
-            raise ValueError(
-                "No feature importances available. Run 'feature_importance' "
-                "first or pass 'importances' explicitly."
+            logger.info(
+                "Top 10 features by importance:\n%s", importances.head(10).to_string()
             )
 
-        n_select = min(self.top_n_features, len(importances))
-        top_features = importances.head(n_select).index.tolist()
+            k = self.config.top_k_features
+            if k is None or k >= len(importances):
+                selected = importances.index.tolist()
+                logger.info(
+                    "Retaining all %d available features (top_k_features not "
+                    "restrictive).",
+                    len(selected),
+                )
+            else:
+                selected = importances.head(k).index.tolist()
+                logger.info("Selected top %d feature(s) by importance.", k)
 
-        self.selected_features_ = top_features
-        logger.info("Selected top %d features: %s", n_select, top_features)
+            self.selected_features_ = selected
+            return X_train[selected], X_test[selected]
 
-        return top_features
+        except ValueError as exc:
+            logger.error("Feature importance ranking failed: %s", exc)
+            raise FeatureEngineeringError(
+                f"Feature importance ranking failed: {exc}"
+            ) from exc
 
-    def save_selected_features(
-        self, features: Optional[List[str]] = None
-    ) -> Path:
-        """Saves the selected feature names to a CSV file.
+    # ------------------------------------------------------------------- #
+    # Step 6: Optional PCA
+    # ------------------------------------------------------------------- #
+    def apply_pca_transform(
+        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Optionally fit a PCA transformer on the selected feature set to
+        further reduce dimensionality while preserving a target cumulative
+        explained variance ratio.
 
         Args:
-            features: Optional list of feature names to save. If not
-                provided, uses ``self.selected_features_``.
+            X_train: Selected training feature matrix.
+            X_test: Selected test feature matrix.
 
         Returns:
-            The path to the saved CSV file.
+            Tuple of (X_train_pca, X_test_pca) as DataFrames with PCA
+            component columns. Returns the input unchanged if
+            ``apply_pca`` is False.
 
         Raises:
-            ValueError: If no features are available to save.
-            OSError: If the file cannot be written to disk.
+            FeatureEngineeringError: If PCA fitting fails.
         """
-        if features is None:
-            features = self.selected_features_
+        if not self.config.apply_pca:
+            logger.info("PCA disabled via config; skipping dimensionality reduction.")
+            return X_train, X_test
 
-        if not features:
-            raise ValueError("No selected features available to save.")
-
+        logger.info(
+            "Applying PCA (target explained variance ratio=%.2f).",
+            self.config.pca_variance_ratio,
+        )
         try:
-            self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame({"feature_name": features}).to_csv(
-                self.output_path, index=False
+            self.pca_ = PCA(
+                n_components=self.config.pca_variance_ratio,
+                random_state=self.config.random_state,
+                svd_solver="full",
             )
-        except OSError as exc:
-            logger.error("Failed to save selected features to %s: %s", self.output_path, exc)
-            raise
+            X_train_pca = self.pca_.fit_transform(X_train)
+            X_test_pca = self.pca_.transform(X_test)
 
-        logger.info("Saved %d selected features to %s.", len(features), self.output_path)
-        return self.output_path
+            component_cols = [f"PC{i + 1}" for i in range(X_train_pca.shape[1])]
+            logger.info(
+                "PCA reduced feature space from %d to %d components "
+                "(explained variance: %.4f).",
+                X_train.shape[1],
+                X_train_pca.shape[1],
+                float(np.sum(self.pca_.explained_variance_ratio_)),
+            )
 
-    def run_pipeline(
-        self, df: pd.DataFrame, target_column: str
-    ) -> Tuple[pd.DataFrame, List[str]]:
-        """Executes the full feature engineering pipeline end to end.
+            return (
+                pd.DataFrame(X_train_pca, columns=component_cols, index=X_train.index),
+                pd.DataFrame(X_test_pca, columns=component_cols, index=X_test.index),
+            )
 
-        Steps:
-            1. Remove irrelevant identifier columns.
-            2. Select numerical features.
-            3. Compute correlation matrix.
-            4. Remove highly correlated features.
-            5. Compute feature importance via Random Forest.
-            6. Select top N important features.
-            7. Save selected features to disk.
+        except ValueError as exc:
+            logger.error("PCA transformation failed: %s", exc)
+            raise FeatureEngineeringError(f"PCA transformation failed: {exc}") from exc
+
+    # ------------------------------------------------------------------- #
+    # Step 7: Persist
+    # ------------------------------------------------------------------- #
+    def save_artifacts(
+        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+    ) -> None:
+        """
+        Persist the final selected feature list, feature importance
+        scores, engineered datasets, and (if fitted) the PCA transformer
+        to disk.
 
         Args:
-            df: Raw input dataframe including the target column.
-            target_column: Name of the column containing class labels.
-
-        Returns:
-            A tuple of (final feature dataframe restricted to selected
-            features, list of selected feature names).
+            X_train: Final engineered training feature matrix.
+            X_test: Final engineered test feature matrix.
 
         Raises:
-            TypeError: If ``df`` is not a pandas DataFrame.
-            ValueError: If ``target_column`` is not present in ``df``.
+            FeatureEngineeringError: If saving any artifact fails.
         """
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input 'df' must be a pandas DataFrame.")
-        if target_column not in df.columns:
-            raise ValueError(f"Target column '{target_column}' not found in dataframe.")
+        try:
+            self.config.models_dir.mkdir(parents=True, exist_ok=True)
+            self.config.processed_data_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Starting feature engineering pipeline on dataframe of shape %s.", df.shape)
+            pd.Series(self.selected_features_, name="feature").to_csv(
+                self.config.models_dir / "selected_features.csv", index=False
+            )
+            logger.info("Selected feature list saved to selected_features.csv.")
 
-        y = df[target_column]
+            if self.feature_importances_ is not None:
+                self.feature_importances_.rename("importance").to_csv(
+                    self.config.processed_data_dir / "feature_importances.csv"
+                )
+                logger.info("Feature importances saved.")
 
-        df_clean = self.remove_irrelevant_features(df.drop(columns=[target_column]))
-        numerical_df = self.select_numerical_features(df_clean)
+            X_train.to_csv(
+                self.config.processed_data_dir / "X_train_fe.csv", index=False
+            )
+            X_test.to_csv(
+                self.config.processed_data_dir / "X_test_fe.csv", index=False
+            )
+            logger.info("Engineered feature sets saved (X_train_fe.csv, X_test_fe.csv).")
 
-        numerical_df = numerical_df.replace([np.inf, -np.inf], np.nan).dropna(axis=0)
-        y = y.loc[numerical_df.index]
+            if self.pca_ is not None:
+                joblib.dump(self.pca_, self.config.models_dir / "pca_transformer.pkl")
+                logger.info("PCA transformer artifact saved.")
 
-        corr_matrix = self.correlation_analysis(numerical_df)
-        reduced_df = self.remove_highly_correlated_features(numerical_df, corr_matrix)
+        except OSError as exc:
+            logger.error("Failed to save feature engineering artifacts: %s", exc)
+            raise FeatureEngineeringError(
+                f"Failed to save feature engineering artifacts: {exc}"
+            ) from exc
 
-        importances = self.feature_importance(reduced_df, y)
-        top_features = self.select_top_features(importances)
+    # ------------------------------------------------------------------- #
+    # Orchestrator
+    # ------------------------------------------------------------------- #
+    def run(self, persist: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Execute the full feature engineering pipeline end-to-end.
 
-        self.save_selected_features(top_features)
+        Args:
+            persist: If True, saves engineered datasets and fitted
+                artifacts to disk. Set to False for in-memory/testing use.
 
-        final_df = reduced_df[top_features]
-        logger.info("Feature engineering pipeline complete. Final shape: %s.", final_df.shape)
+        Returns:
+            Tuple of (X_train_engineered, X_test_engineered).
 
-        final_df[target_column] = y return final_df, top_features
+        Raises:
+            FeatureEngineeringError: Propagated from any pipeline stage on
+                unrecoverable failure.
+        """
+        logger.info("=== Starting feature engineering pipeline ===")
+
+        X_train, X_test, y_train, y_test = self.load_processed_data()
+        self.validate_inputs(X_train, y_train)
+
+        X_train, X_test = self.remove_low_variance_features(X_train, X_test)
+        X_train, X_test = self.remove_correlated_features(X_train, X_test)
+        X_train, X_test = self.select_top_features_by_importance(
+            X_train, X_test, y_train
+        )
+        X_train, X_test = self.apply_pca_transform(X_train, X_test)
+
+        if persist:
+            self.save_artifacts(X_train, X_test)
+
+        logger.info("=== Feature engineering pipeline completed successfully ===")
+        return X_train, X_test
+
+
+# --------------------------------------------------------------------------- #
+# CLI Entry Point
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    """
+    Command-line entry point for running the feature engineering pipeline
+    standalone, e.g.:
+
+        python -m src.features.feature_engineering --top-k 30
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Engineer and select features for CICIDS2017 intrusion data."
+    )
+    parser.add_argument(
+        "--processed-data-dir",
+        type=str,
+        default="data/processed",
+        help="Directory containing processed train/test CSV files.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=30,
+        help="Number of top features to retain by importance ranking.",
+    )
+    parser.add_argument(
+        "--apply-pca",
+        action="store_true",
+        help="If set, additionally fit a PCA transformer on selected features.",
+    )
+    args = parser.parse_args()
+
+    try:
+        config = FeatureEngineeringConfig(
+            processed_data_dir=Path(args.processed_data_dir),
+            top_k_features=args.top_k,
+            apply_pca=args.apply_pca,
+        )
+        engineer = FeatureEngineer(config)
+        engineer.run(persist=True)
+    except FeatureEngineeringError as exc:
+        logger.critical("Feature engineering pipeline failed: %s", exc)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
