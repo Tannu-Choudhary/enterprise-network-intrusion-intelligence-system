@@ -1,9 +1,10 @@
 numpy
 pandas
-matplotlib
-seaborn
 scikit-learn
 joblib
-streamlit
+matplotlib
+seaborn
 plotly
-jupyter
+streamlit
+tqdm
+python-dateutil
