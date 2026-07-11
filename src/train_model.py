@@ -1,602 +1,613 @@
+"""Model training pipeline for the Enterprise Network Intrusion Intelligence System.
+
+This module trains exactly two candidate models -- a Random Forest and an
+XGBoost classifier, each with fixed, non-tuned hyperparameters -- on the
+engineered feature set (``X_train_fe.csv`` / ``y_train.csv``). To select a
+winner without ever touching the held-out test set, a stratified
+validation split is carved out of the training data. Each candidate is
+trained exactly once on the remaining training rows and scored on that
+validation split using the weighted F1-score. The higher-scoring model
+(weighted precision as tiebreaker) is persisted; the losing model is
+discarded and never written to disk.
+
+All artifacts are written atomically: they are first serialized to
+temporary files and only moved into their final location after every
+prior step has succeeded, guaranteeing that ``models/best_model.pkl`` is
+never left empty or corrupted if training or evaluation raises.
+
+Outputs (written to ``models/``)
+---------------------------------
+- best_model.pkl : the winning fitted estimator.
+- label_encoder.pkl : fitted ``LabelEncoder`` for the "Attack Type" target.
+- selected_features.csv : ordered feature names used by the model.
+- training_metadata.json : winning model name, hyperparameters, and
+  validation metrics.
+
+Examples
+--------
+>>> from src.train_model import ModelTrainer
+>>> trainer = ModelTrainer()
+>>> summary = trainer.run()
 """
-Enterprise Network Intrusion Intelligence System
---------------------------------------------------
-Model training module for the CIC-IDS2017 intrusion detection pipeline.
 
-This module defines the ModelTrainer class, which is responsible for:
-    - Loading the processed dataset and selected feature list.
-    - Preparing training and testing splits.
-    - Training Logistic Regression and Random Forest classifiers.
-    - Evaluating both models on standard classification metrics.
-    - Selecting the best-performing model based on F1-score.
-    - Persisting the best model and metrics report to disk.
-
-Author: Senior ML Engineering Team
-"""
-
-import logging
+import json
+import os
+import tempfile
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple, Union
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-)
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBClassifier
 
-# --------------------------------------------------------------------------
-# Logging configuration
-# --------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-)
-logger = logging.getLogger(__name__)
+from src.utils.config import get_config
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class TrainingError(Exception):
+    """Base exception for all model-training pipeline failures."""
+
+
+class DataLoadError(TrainingError):
+    """Raised when the engineered training data cannot be loaded or is invalid."""
+
+
+class ArtifactSaveError(TrainingError):
+    """Raised when a trained artifact fails to persist to disk."""
+
+
+# Fixed, non-tuned hyperparameters. No parameter grid or search is used.
+RANDOM_FOREST_PARAMS: Dict[str, Any] = {
+    "n_estimators": 150,
+    "max_depth": 20,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "class_weight": "balanced_subsample",
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
+XGBOOST_PARAMS: Dict[str, Any] = {
+    "n_estimators": 200,
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "objective": "multi:softprob",
+    "eval_metric": "mlogloss",
+    "tree_method": "hist",
+    "random_state": 42,
+    "n_jobs": -1,
+    "verbosity": 0,
+}
+
+VALIDATION_FRACTION: float = 0.1
+RANDOM_STATE: int = 42
 
 
 class ModelTrainer:
-    """Trains, evaluates, and persists intrusion detection models.
+    """Trains, compares, and persists the intrusion-detection model.
 
-    This class orchestrates the end-to-end supervised learning workflow
-    for the CIC-IDS2017 network intrusion dataset. It loads a processed
-    dataset and a curated list of selected features, trains multiple
-    classifiers, evaluates them against standard metrics, and saves the
-    best-performing model to disk based on F1-score.
+    Parameters
+    ----------
+    data_dir : str or pathlib.Path, optional
+        Directory containing ``X_train_fe.csv`` and ``y_train.csv``. If
+        ``None``, taken from ``Config.PROCESSED_DATA_DIR`` (falling back
+        to ``"data/processed"``).
+    model_dir : str or pathlib.Path, optional
+        Directory to which the winning model artifacts are written. If
+        ``None``, taken from ``Config.MODELS_DIR`` (falling back to
+        ``"models"``).
+    validation_fraction : float, default=0.1
+        Fraction of the training data held out, via stratified split, to
+        score and compare the two candidate models.
+    random_state : int, default=42
+        Seed used for the train/validation split.
 
-    Attributes:
-        dataset_path (Path): Path to the processed dataset CSV file.
-        features_path (Path): Path to the selected features CSV file.
-        target_column (str): Name of the target/label column.
-        model_output_path (Path): Path where the best model is saved.
-        metrics_output_path (Path): Path where evaluation metrics are saved.
-        test_size (float): Proportion of data reserved for testing.
-        random_state (int): Random seed for reproducibility.
-        dataset (pd.DataFrame): Loaded processed dataset.
-        selected_features (List[str]): List of selected feature names.
-        X_train (pd.DataFrame): Training feature matrix.
-        X_test (pd.DataFrame): Testing feature matrix.
-        y_train (pd.Series): Training target vector.
-        y_test (pd.Series): Testing target vector.
-        trained_models (Dict[str, Any]): Mapping of model name to fitted
-            estimator.
-        evaluation_results (Dict[str, Dict[str, Any]]): Mapping of model
-            name to its computed evaluation metrics.
+    Attributes
+    ----------
+    data_dir : pathlib.Path
+        Resolved location of the engineered training data.
+    model_dir : pathlib.Path
+        Resolved location where artifacts are persisted.
     """
+
+    _TARGET_COLUMN = "Attack Type"
 
     def __init__(
         self,
-        dataset_path: str = "data/processed/processed_dataset.csv",
-        features_path: str = "data/processed/selected_features.csv",
-        target_column: str = "Label",
-        model_output_path: str = "models/best_model.pkl",
-        metrics_output_path: str = "models/model_metrics.csv",
-        test_size: float = 0.2,
-        random_state: int = 42,
+        data_dir: Union[str, Path, None] = None,
+        model_dir: Union[str, Path, None] = None,
+        validation_fraction: float = VALIDATION_FRACTION,
+        random_state: int = RANDOM_STATE,
     ) -> None:
-        """Initializes the ModelTrainer with configuration paths and parameters.
-
-        Args:
-            dataset_path: Path to the processed dataset CSV file.
-            features_path: Path to the CSV file containing selected feature
-                names.
-            target_column: Name of the label/target column in the dataset.
-            model_output_path: Destination path for the serialized best model.
-            metrics_output_path: Destination path for the metrics report CSV.
-            test_size: Fraction of the dataset to reserve for testing.
-            random_state: Seed used for reproducible train/test splits and
-                model initialization.
-        """
-        self.dataset_path = Path(dataset_path)
-        self.features_path = Path(features_path)
-        self.target_column = target_column
-        self.model_output_path = Path(model_output_path)
-        self.metrics_output_path = Path(metrics_output_path)
-        self.test_size = test_size
+        self.data_dir: Path = Path(
+            data_dir if data_dir is not None else getattr(get_config(), "PROCESSED_DATA_DIR", "data/processed")
+        )
+        self.model_dir: Path = Path(
+            model_dir if model_dir is not None else getattr(get_config(), "MODELS_DIR", "models")
+        )
+        self.validation_fraction = validation_fraction
         self.random_state = random_state
 
-        self.dataset: pd.DataFrame = pd.DataFrame()
-        self.selected_features: List[str] = []
+    def run(self) -> Dict[str, Any]:
+        """Execute the full training pipeline end to end.
 
-        self.X_train: pd.DataFrame = pd.DataFrame()
-        self.X_test: pd.DataFrame = pd.DataFrame()
-        self.y_train: pd.Series = pd.Series(dtype="object")
-        self.y_test: pd.Series = pd.Series(dtype="object")
+        Returns
+        -------
+        dict
+            Summary containing the winning model's name and its
+            validation metrics.
 
-        self.trained_models: Dict[str, Any] = {}
-        self.evaluation_results: Dict[str, Dict[str, Any]] = {}
-
-        logger.info("ModelTrainer initialized successfully.")
-
-    # ----------------------------------------------------------------------
-    # Data loading
-    # ----------------------------------------------------------------------
-    def load_dataset(self) -> pd.DataFrame:
-        """Loads the processed dataset from disk.
-
-        Returns:
-            The loaded dataset as a pandas DataFrame.
-
-        Raises:
-            FileNotFoundError: If the dataset file does not exist.
-            ValueError: If the dataset is empty or the target column is
-                missing/invalid.
+        Raises
+        ------
+        DataLoadError
+            If the engineered training data cannot be loaded or is
+            malformed.
+        TrainingError
+            If model fitting fails.
+            ArtifactSaveError is raised, and re-raised as such, if
+            persistence fails.
         """
-        logger.info("Loading dataset from '%s'.", self.dataset_path)
-
-        if not self.dataset_path.exists():
-            logger.error("Dataset file not found at '%s'.", self.dataset_path)
-            raise FileNotFoundError(
-                f"Dataset file not found at '{self.dataset_path}'. "
-                "Ensure the processed dataset has been generated."
-            )
-
-        try:
-            self.dataset = pd.read_csv(self.dataset_path)
-        except Exception as exc:  # noqa: BLE001 - surface any parsing error
-            logger.error("Failed to read dataset: %s", exc)
-            raise ValueError(f"Unable to parse dataset CSV: {exc}") from exc
-
-        if self.dataset.empty:
-            logger.error("Loaded dataset is empty.")
-            raise ValueError("Loaded dataset is empty. Cannot proceed with training.")
-
-        if self.target_column not in self.dataset.columns:
-            logger.error(
-                "Target column '%s' not found in dataset columns.",
-                self.target_column,
-            )
-            raise ValueError(
-                f"Target column '{self.target_column}' is missing from the "
-                "dataset. Cannot proceed with training."
-            )
-
-        if self.dataset[self.target_column].nunique(dropna=True) < 2:
-            logger.error("Target column '%s' has fewer than 2 classes.", self.target_column)
-            raise ValueError(
-                f"Target column '{self.target_column}' must contain at least "
-                "two distinct classes for classification."
-            )
-
-        logger.info(
-            "Dataset loaded successfully with shape %s.", self.dataset.shape
-        )
-        return self.dataset
-
-    def load_selected_features(self) -> List[str]:
-        """Loads the list of selected feature names from disk.
-
-        The selected features CSV is expected to contain a single column
-        of feature names (header optional, but recommended).
-
-        Returns:
-            A list of selected feature column names.
-
-        Raises:
-            FileNotFoundError: If the selected features file does not exist.
-            ValueError: If the file is empty or contains no valid features
-                present in the dataset.
-        """
-        logger.info(
-            "Loading selected features from '%s'.", self.features_path
-        )
-
-        if not self.features_path.exists():
-            logger.error(
-                "Selected features file not found at '%s'.", self.features_path
-            )
-            raise FileNotFoundError(
-                f"Selected features file not found at '{self.features_path}'."
-            )
-
-        try:
-            features_df = pd.read_csv(self.features_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to read selected features file: %s", exc)
-            raise ValueError(
-                f"Unable to parse selected features CSV: {exc}"
-            ) from exc
-
-        if features_df.empty:
-            logger.error("Selected features file is empty.")
-            raise ValueError("Selected features file contains no data.")
-
-        # Use the first column regardless of its header name.
-        feature_list = (
-            features_df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
-        )
-
-        if not feature_list:
-            logger.error("No valid feature names found in selected features file.")
-            raise ValueError("Selected features file contains no valid feature names.")
-
-        # Validate features exist within the loaded dataset (if already loaded).
-        if not self.dataset.empty:
-            missing = [f for f in feature_list if f not in self.dataset.columns]
-            if missing:
-                logger.warning(
-                    "The following selected features are missing from the "
-                    "dataset and will be ignored: %s",
-                    missing,
-                )
-                feature_list = [f for f in feature_list if f in self.dataset.columns]
-
-            if not feature_list:
-                logger.error(
-                    "None of the selected features exist in the dataset."
-                )
-                raise ValueError(
-                    "None of the selected features are present in the dataset."
-                )
-
-        self.selected_features = feature_list
-        logger.info(
-            "Loaded %d selected feature(s).", len(self.selected_features)
-        )
-        return self.selected_features
-
-    # ----------------------------------------------------------------------
-    # Data preparation
-    # ----------------------------------------------------------------------
-    def prepare_training_data(
-        self,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """Prepares training and testing splits using the selected features.
-
-        Returns:
-            A tuple of (X_train, X_test, y_train, y_test).
-
-        Raises:
-            ValueError: If the dataset or selected features have not been
-                loaded, or if data preparation fails.
-        """
-        if self.dataset.empty:
-            logger.error("Dataset has not been loaded prior to preparation.")
-            raise ValueError("Dataset must be loaded before preparing training data.")
-
-        if not self.selected_features:
-            logger.error("Selected features have not been loaded prior to preparation.")
-            raise ValueError(
-                "Selected features must be loaded before preparing training data."
-            )
-
-        logger.info("Preparing training and testing datasets.")
-
-        try:
-            features_df = self.dataset[self.selected_features].copy()
-            target_series = self.dataset[self.target_column].copy()
-
-            # Drop rows with missing values to ensure model stability.
-            combined = pd.concat([features_df, target_series], axis=1)
-            initial_rows = len(combined)
-            combined = combined.dropna()
-            dropped_rows = initial_rows - len(combined)
-            if dropped_rows > 0:
-                logger.warning(
-                    "Dropped %d row(s) containing missing values.", dropped_rows
-                )
-
-            if combined.empty:
-                raise ValueError(
-                    "No data remains after dropping missing values."
-                )
-
-            features_df = combined[self.selected_features]
-            target_series = combined[self.target_column]
-
-            (
-                self.X_train,
-                self.X_test,
-                self.y_train,
-                self.y_test,
-            ) = train_test_split(
-                features_df,
-                target_series,
-                test_size=self.test_size,
-                random_state=self.random_state,
-                stratify=target_series,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to prepare training data: %s", exc)
-            raise ValueError(f"Data preparation failed: {exc}") from exc
-
-        logger.info(
-            "Training data prepared. Train shape: %s | Test shape: %s.",
-            self.X_train.shape,
-            self.X_test.shape,
-        )
-        return self.X_train, self.X_test, self.y_train, self.y_test
-
-    # ----------------------------------------------------------------------
-    # Model training
-    # ----------------------------------------------------------------------
-    def train_logistic_regression(self) -> LogisticRegression:
-        """Trains a Logistic Regression classifier on the prepared data.
-
-        Returns:
-            The fitted LogisticRegression model.
-
-        Raises:
-            ValueError: If training data has not been prepared.
-            RuntimeError: If model training fails.
-        """
-        self._validate_training_data_ready()
-        logger.info("Training Logistic Regression model.")
-
-        try:
-            model = LogisticRegression(
-                max_iter=1000,
-                random_state=self.random_state,
-                n_jobs=-1,
-            )
-            model.fit(self.X_train, self.y_train)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Logistic Regression training failed: %s", exc)
-            raise RuntimeError(
-                f"Logistic Regression training failed: {exc}"
-            ) from exc
-
-        self.trained_models["LogisticRegression"] = model
-        logger.info("Logistic Regression training complete.")
-        return model
-
-    def train_random_forest(self) -> RandomForestClassifier:
-        """Trains a Random Forest classifier on the prepared data.
-
-        Returns:
-            The fitted RandomForestClassifier model.
-
-        Raises:
-            ValueError: If training data has not been prepared.
-            RuntimeError: If model training fails.
-        """
-        self._validate_training_data_ready()
-        logger.info("Training Random Forest model.")
-
-        try:
-            model = RandomForestClassifier(
-                n_estimators=200,
-                random_state=self.random_state,
-                n_jobs=-1,
-            )
-            model.fit(self.X_train, self.y_train)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Random Forest training failed: %s", exc)
-            raise RuntimeError(f"Random Forest training failed: {exc}") from exc
-
-        self.trained_models["RandomForest"] = model
-        logger.info("Random Forest training complete.")
-        return model
-
-    def _validate_training_data_ready(self) -> None:
-        """Validates that training data has been prepared.
-
-        Raises:
-            ValueError: If X_train or y_train are empty.
-        """
-        if self.X_train.empty or self.y_train.empty:
-            logger.error("Training data is not available.")
-            raise ValueError(
-                "Training data has not been prepared. Call "
-                "prepare_training_data() before training a model."
-            )
-
-    # ----------------------------------------------------------------------
-    # Evaluation
-    # ----------------------------------------------------------------------
-    def evaluate_models(self) -> Dict[str, Dict[str, Any]]:
-        """Evaluates all trained models on the test set.
-
-        Computes accuracy, precision, recall, F1-score, confusion matrix,
-        and a full classification report for each trained model.
-
-        Returns:
-            A dictionary mapping model name to its evaluation metrics.
-
-        Raises:
-            ValueError: If no models have been trained yet, or test data
-                is unavailable.
-        """
-        if not self.trained_models:
-            logger.error("No trained models available for evaluation.")
-            raise ValueError(
-                "No models have been trained. Train at least one model "
-                "before calling evaluate_models()."
-            )
-
-        if self.X_test.empty or self.y_test.empty:
-            logger.error("Test data is not available for evaluation.")
-            raise ValueError(
-                "Test data has not been prepared. Call "
-                "prepare_training_data() before evaluation."
-            )
-
-        logger.info("Evaluating trained models.")
-        results: Dict[str, Dict[str, Any]] = {}
-
-        for model_name, model in self.trained_models.items():
-            logger.info("Evaluating model: %s.", model_name)
-            try:
-                predictions = model.predict(self.X_test)
-
-                accuracy = accuracy_score(self.y_test, predictions)
-                precision = precision_score(
-                    self.y_test, predictions, average="weighted", zero_division=0
-                )
-                recall = recall_score(
-                    self.y_test, predictions, average="weighted", zero_division=0
-                )
-                f1 = f1_score(
-                    self.y_test, predictions, average="weighted", zero_division=0
-                )
-                conf_matrix = confusion_matrix(self.y_test, predictions)
-                report = classification_report(
-                    self.y_test, predictions, zero_division=0
-                )
-
-                results[model_name] = {
-                    "accuracy": accuracy,
-                    "precision": precision,
-                    "recall": recall,
-                    "f1_score": f1,
-                    "confusion_matrix": conf_matrix,
-                    "classification_report": report,
-                }
-
-                logger.info(
-                    "%s -> Accuracy: %.4f | Precision: %.4f | Recall: %.4f | "
-                    "F1-score: %.4f",
-                    model_name,
-                    accuracy,
-                    precision,
-                    recall,
-                    f1,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Evaluation failed for model '%s': %s", model_name, exc)
-                raise RuntimeError(
-                    f"Evaluation failed for model '{model_name}': {exc}"
-                ) from exc
-
-        self.evaluation_results = results
-        logger.info("Model evaluation complete.")
-        return results
-
-    # ----------------------------------------------------------------------
-    # Model persistence
-    # ----------------------------------------------------------------------
-    def save_best_model(self) -> str:
-        """Selects the best model by F1-score and persists it to disk.
-
-        Also writes a metrics report CSV summarizing all evaluated models.
-
-        Returns:
-            The name of the best-performing model.
-
-        Raises:
-            ValueError: If no evaluation results are available.
-            RuntimeError: If saving the model or metrics fails.
-        """
-        if not self.evaluation_results:
-            logger.error("No evaluation results available for model selection.")
-            raise ValueError(
-                "No evaluation results found. Call evaluate_models() before "
-                "save_best_model()."
-            )
-
-        best_model_name = max(
-            self.evaluation_results,
-            key=lambda name: self.evaluation_results[name]["f1_score"],
-        )
-        best_model = self.trained_models[best_model_name]
-        best_f1 = self.evaluation_results[best_model_name]["f1_score"]
-
-        logger.info(
-            "Best model selected: '%s' with F1-score %.4f.",
-            best_model_name,
-            best_f1,
-        )
-
-        try:
-            self.model_output_path.parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump(best_model, self.model_output_path)
-            logger.info("Best model saved to '%s'.", self.model_output_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to save best model: %s", exc)
-            raise RuntimeError(f"Failed to save best model: {exc}") from exc
-
-        try:
-            self._save_metrics_report()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to save metrics report: %s", exc)
-            raise RuntimeError(f"Failed to save metrics report: {exc}") from exc
-
-        return best_model_name
-
-    def _save_metrics_report(self) -> None:
-        """Writes a CSV summary of evaluation metrics for all models.
-
-        Raises:
-            RuntimeError: If the metrics file cannot be written.
-        """
-        logger.info("Saving metrics report to '%s'.", self.metrics_output_path)
-
-        rows = []
-        for model_name, metrics in self.evaluation_results.items():
-            rows.append(
-                {
-                    "model_name": model_name,
-                    "accuracy": metrics["accuracy"],
-                    "precision": metrics["precision"],
-                    "recall": metrics["recall"],
-                    "f1_score": metrics["f1_score"],
-                    "confusion_matrix": metrics["confusion_matrix"].tolist(),
-                    "classification_report": metrics["classification_report"],
-                }
-            )
-
-        metrics_df = pd.DataFrame(rows)
-
-        self.metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics_df.to_csv(self.metrics_output_path, index=False)
-        logger.info("Metrics report saved successfully.")
-
-    # ----------------------------------------------------------------------
-    # Pipeline orchestration
-    # ----------------------------------------------------------------------
-    def run_pipeline(self) -> str:
-        """Executes the full model training pipeline end-to-end.
-
-        Steps:
-            1. Load the processed dataset.
-            2. Load the selected feature list.
-            3. Prepare training/testing splits.
-            4. Train Logistic Regression and Random Forest models.
-            5. Evaluate both models.
-            6. Save the best model and metrics report.
-
-        Returns:
-            The name of the best-performing model.
-
-        Raises:
-            Exception: Propagates any exception raised during the pipeline,
-                after logging the failure context.
-        """
+        start_time = time.time()
         logger.info("Starting model training pipeline.")
 
+        X, y_raw, feature_names = self._load_data()
+        label_encoder, y_encoded = self._encode_labels(y_raw)
+
+        X_train_split, X_val_split, y_train_split, y_val_split = self._split(X, y_encoded)
+        # Free the full-size intermediate frame as soon as it is no longer needed.
+        del X, y_encoded
+
+        rf_model = self._train_random_forest(X_train_split, y_train_split)
+        rf_metrics = self._evaluate(rf_model, X_val_split, y_val_split, "RandomForest")
+
+        xgb_model = self._train_xgboost(X_train_split, y_train_split)
+        xgb_metrics = self._evaluate(xgb_model, X_val_split, y_val_split, "XGBoost")
+
+        best_name, best_model, best_params, best_metrics = self._select_best(
+            rf_model, rf_metrics, xgb_model, xgb_metrics
+        )
+
+        metadata = self._build_metadata(
+            best_name=best_name,
+            best_params=best_params,
+            best_metrics=best_metrics,
+            feature_names=feature_names,
+            train_rows=len(X_train_split),
+            val_rows=len(X_val_split),
+        )
+
+        self._save_artifacts(
+            model=best_model,
+            label_encoder=label_encoder,
+            feature_names=feature_names,
+            metadata=metadata,
+        )
+
+        elapsed = time.time() - start_time
+        logger.info(
+            "Training pipeline complete in %.1fs. Selected model: %s (weighted F1=%.4f).",
+            elapsed,
+            best_name,
+            best_metrics["f1_weighted"],
+        )
+        return {"best_model_name": best_name, "metrics": best_metrics, "elapsed_seconds": elapsed}
+
+    def _load_data(self) -> Tuple[pd.DataFrame, pd.Series, list]:
+        """Load ``X_train_fe.csv`` and ``y_train.csv`` exactly once each.
+
+        Returns
+        -------
+        tuple of (pandas.DataFrame, pandas.Series, list of str)
+            The feature matrix, the raw target series, and the ordered
+            list of feature column names.
+
+        Raises
+        ------
+        DataLoadError
+            If either file is missing, empty, or row counts mismatch.
+        """
+        x_path = self.data_dir / "X_train_fe.csv"
+        y_path = self.data_dir / "y_train.csv"
+
+        if not x_path.is_file():
+            raise DataLoadError(f"Required file not found: '{x_path}'.")
+        if not y_path.is_file():
+            raise DataLoadError(f"Required file not found: '{y_path}'.")
+
         try:
-            self.load_dataset()
-            self.load_selected_features()
-            self.prepare_training_data()
+            X = pd.read_csv(x_path)
+        except Exception as exc:
+            raise DataLoadError(f"Failed to read '{x_path}': {exc}") from exc
 
-            self.train_logistic_regression()
-            self.train_random_forest()
+        try:
+            y_df = pd.read_csv(y_path)
+        except Exception as exc:
+            raise DataLoadError(f"Failed to read '{y_path}': {exc}") from exc
 
-            self.evaluate_models()
-            best_model_name = self.save_best_model()
-
-            logger.info(
-                "Pipeline completed successfully. Best model: '%s'.",
-                best_model_name,
+        if X.empty:
+            raise DataLoadError(f"'{x_path}' contains no rows.")
+        if y_df.empty:
+            raise DataLoadError(f"'{y_path}' contains no rows.")
+        if len(X) != len(y_df):
+            raise DataLoadError(
+                f"Row count mismatch between X_train_fe.csv ({len(X)}) and y_train.csv ({len(y_df)})."
             )
-            return best_model_name
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Model training pipeline failed: %s", exc)
+        if self._TARGET_COLUMN not in y_df.columns:
+            raise DataLoadError(
+                f"Target column '{self._TARGET_COLUMN}' not found in '{y_path}'. "
+                f"Available columns: {list(y_df.columns)}"
+            )
+
+        # Downcast numeric feature columns to float32 in place to roughly
+        # halve memory usage across ~2M rows without altering values
+        # meaningfully for tree-based models.
+        numeric_columns = X.select_dtypes(include=[np.number]).columns
+        X[numeric_columns] = X[numeric_columns].astype(np.float32)
+
+        feature_names = X.columns.tolist()
+        y_series = y_df[self._TARGET_COLUMN]
+
+        logger.info(
+            "Loaded training data: X_train_fe.csv shape=%s, y_train.csv shape=%s.",
+            X.shape,
+            y_df.shape,
+        )
+        return X, y_series, feature_names
+
+    def _encode_labels(self, y_raw: pd.Series) -> Tuple[LabelEncoder, np.ndarray]:
+        """Fit a ``LabelEncoder`` on the raw attack-type labels.
+
+        Parameters
+        ----------
+        y_raw : pandas.Series
+            Raw string labels from the "Attack Type" column.
+
+        Returns
+        -------
+        tuple of (sklearn.preprocessing.LabelEncoder, numpy.ndarray)
+            The fitted encoder and the integer-encoded label array.
+
+        Raises
+        ------
+        DataLoadError
+            If encoding fails (e.g. due to unsupported label values).
+        """
+        try:
+            label_encoder = LabelEncoder()
+            y_encoded = label_encoder.fit_transform(y_raw)
+        except Exception as exc:
+            raise DataLoadError(f"Failed to encode target labels: {exc}") from exc
+
+        logger.info("Encoded %d distinct attack-type classes.", len(label_encoder.classes_))
+        return label_encoder, y_encoded
+
+    def _split(
+        self, X: pd.DataFrame, y_encoded: np.ndarray
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray]:
+        """Carve a stratified validation split out of the training data.
+
+        This split exists solely to compare the two candidate models
+        without touching ``X_test_fe.csv`` / ``y_test.csv``, which are
+        reserved for ``evaluate_model.py``.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Full engineered training feature matrix.
+        y_encoded : numpy.ndarray
+            Full integer-encoded target array, aligned with ``X``.
+
+        Returns
+        -------
+        tuple
+            ``(X_train_split, X_val_split, y_train_split, y_val_split)``.
+
+        Raises
+        ------
+        TrainingError
+            If the split cannot be performed (e.g. a class has too few
+            samples to stratify).
+        """
+        try:
+            X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
+                X,
+                y_encoded,
+                test_size=self.validation_fraction,
+                random_state=self.random_state,
+                stratify=y_encoded,
+            )
+        except Exception as exc:
+            raise TrainingError(f"Failed to create train/validation split: {exc}") from exc
+
+        logger.info(
+            "Split data into %d training rows and %d validation rows.",
+            len(X_train_split),
+            len(X_val_split),
+        )
+        return X_train_split, X_val_split, y_train_split, y_val_split
+
+    def _train_random_forest(self, X_train: pd.DataFrame, y_train: np.ndarray) -> RandomForestClassifier:
+        """Fit exactly one ``RandomForestClassifier`` with fixed hyperparameters.
+
+        Parameters
+        ----------
+        X_train : pandas.DataFrame
+            Training feature matrix.
+        y_train : numpy.ndarray
+            Integer-encoded training labels.
+
+        Returns
+        -------
+        sklearn.ensemble.RandomForestClassifier
+            The fitted model.
+
+        Raises
+        ------
+        TrainingError
+            If fitting fails.
+        """
+        logger.info("Training RandomForestClassifier with params: %s", RANDOM_FOREST_PARAMS)
+        try:
+            model = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
+            model.fit(X_train, y_train)
+        except Exception as exc:
+            raise TrainingError(f"RandomForest training failed: {exc}") from exc
+        logger.info("RandomForestClassifier training complete.")
+        return model
+
+    def _train_xgboost(self, X_train: pd.DataFrame, y_train: np.ndarray) -> XGBClassifier:
+        """Fit exactly one ``XGBClassifier`` with fixed hyperparameters.
+
+        Parameters
+        ----------
+        X_train : pandas.DataFrame
+            Training feature matrix.
+        y_train : numpy.ndarray
+            Integer-encoded training labels.
+
+        Returns
+        -------
+        xgboost.XGBClassifier
+            The fitted model.
+
+        Raises
+        ------
+        TrainingError
+            If fitting fails.
+        """
+        logger.info("Training XGBClassifier with params: %s", XGBOOST_PARAMS)
+        try:
+            num_classes = int(np.unique(y_train).size)
+            model = XGBClassifier(num_class=num_classes, **XGBOOST_PARAMS)
+            model.fit(X_train, y_train)
+        except Exception as exc:
+            raise TrainingError(f"XGBoost training failed: {exc}") from exc
+        logger.info("XGBClassifier training complete.")
+        return model
+
+    def _evaluate(
+        self, model: Any, X_val: pd.DataFrame, y_val: np.ndarray, model_name: str
+    ) -> Dict[str, float]:
+        """Score a fitted model on the validation split using weighted metrics.
+
+        Parameters
+        ----------
+        model : estimator
+            A fitted classifier exposing ``predict``.
+        X_val : pandas.DataFrame
+            Validation feature matrix.
+        y_val : numpy.ndarray
+            Integer-encoded validation labels.
+        model_name : str
+            Name used for logging.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``accuracy``, ``precision_weighted``,
+            ``recall_weighted``, and ``f1_weighted``.
+
+        Raises
+        ------
+        TrainingError
+            If prediction or metric computation fails.
+        """
+        try:
+            y_pred = model.predict(X_val)
+            metrics = {
+                "accuracy": float(accuracy_score(y_val, y_pred)),
+                "precision_weighted": float(
+                    precision_score(y_val, y_pred, average="weighted", zero_division=0)
+                ),
+                "recall_weighted": float(
+                    recall_score(y_val, y_pred, average="weighted", zero_division=0)
+                ),
+                "f1_weighted": float(f1_score(y_val, y_pred, average="weighted", zero_division=0)),
+            }
+        except Exception as exc:
+            raise TrainingError(f"Evaluation of {model_name} failed: {exc}") from exc
+
+        logger.info("%s validation metrics: %s", model_name, metrics)
+        return metrics
+
+    def _select_best(
+        self,
+        rf_model: RandomForestClassifier,
+        rf_metrics: Dict[str, float],
+        xgb_model: XGBClassifier,
+        xgb_metrics: Dict[str, float],
+    ) -> Tuple[str, Any, Dict[str, Any], Dict[str, float]]:
+        """Select the better of the two candidates by weighted F1-score.
+
+        Ties on weighted F1-score are broken by weighted precision.
+
+        Parameters
+        ----------
+        rf_model : sklearn.ensemble.RandomForestClassifier
+            Fitted Random Forest model.
+        rf_metrics : dict
+            Validation metrics for the Random Forest model.
+        xgb_model : xgboost.XGBClassifier
+            Fitted XGBoost model.
+        xgb_metrics : dict
+            Validation metrics for the XGBoost model.
+
+        Returns
+        -------
+        tuple
+            ``(best_name, best_model, best_hyperparameters, best_metrics)``.
+        """
+        rf_f1 = rf_metrics["f1_weighted"]
+        xgb_f1 = xgb_metrics["f1_weighted"]
+
+        if rf_f1 > xgb_f1:
+            winner = ("RandomForest", rf_model, RANDOM_FOREST_PARAMS, rf_metrics)
+        elif xgb_f1 > rf_f1:
+            winner = ("XGBoost", xgb_model, XGBOOST_PARAMS, xgb_metrics)
+        else:
+            # Weighted F1 tie: fall back to weighted precision.
+            if rf_metrics["precision_weighted"] >= xgb_metrics["precision_weighted"]:
+                winner = ("RandomForest", rf_model, RANDOM_FOREST_PARAMS, rf_metrics)
+            else:
+                winner = ("XGBoost", xgb_model, XGBOOST_PARAMS, xgb_metrics)
+
+        logger.info("Selected best model: %s", winner[0])
+        return winner
+
+    def _build_metadata(
+        self,
+        best_name: str,
+        best_params: Dict[str, Any],
+        best_metrics: Dict[str, float],
+        feature_names: list,
+        train_rows: int,
+        val_rows: int,
+    ) -> Dict[str, Any]:
+        """Assemble the training metadata dictionary.
+
+        Parameters
+        ----------
+        best_name : str
+            Name of the winning model ("RandomForest" or "XGBoost").
+        best_params : dict
+            Hyperparameters used to fit the winning model.
+        best_metrics : dict
+            Validation metrics of the winning model.
+        feature_names : list of str
+            Ordered feature names used for training.
+        train_rows : int
+            Number of rows used to fit the winning model.
+        val_rows : int
+            Number of rows used for validation-based model selection.
+
+        Returns
+        -------
+        dict
+            Metadata written to ``training_metadata.json``.
+        """
+        return {
+            "best_model_name": best_name,
+            "hyperparameters": best_params,
+            "validation_metrics": best_metrics,
+            "feature_count": len(feature_names),
+            "training_rows": train_rows,
+            "validation_rows": val_rows,
+            "validation_fraction": self.validation_fraction,
+            "random_state": self.random_state,
+            "trained_at": pd.Timestamp.utcnow().isoformat(),
+        }
+
+    def _save_artifacts(
+        self,
+        model: Any,
+        label_encoder: LabelEncoder,
+        feature_names: list,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Atomically persist the winning model and its supporting artifacts.
+
+        Each artifact is first written to a temporary file in
+        ``model_dir`` and only moved into its final name via
+        ``os.replace`` after the write succeeds. If any step fails, no
+        partially written or corrupted artifact is left behind under the
+        final filenames.
+
+        Parameters
+        ----------
+        model : estimator
+            The winning fitted model.
+        label_encoder : sklearn.preprocessing.LabelEncoder
+            The fitted label encoder.
+        feature_names : list of str
+            Ordered feature names used for training.
+        metadata : dict
+            Training metadata to serialize as JSON.
+
+        Raises
+        ------
+        ArtifactSaveError
+            If any artifact fails to serialize or persist.
+        """
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self._atomic_joblib_dump(model, self.model_dir / "best_model.pkl")
+            self._atomic_joblib_dump(label_encoder, self.model_dir / "label_encoder.pkl")
+            self._atomic_write_csv(feature_names, self.model_dir / "selected_features.csv")
+            self._atomic_write_json(metadata, self.model_dir / "training_metadata.json")
+        except Exception as exc:
+            raise ArtifactSaveError(f"Failed to persist model artifacts: {exc}") from exc
+
+        logger.info("All model artifacts saved successfully to '%s'.", self.model_dir)
+
+    @staticmethod
+    def _atomic_joblib_dump(obj: Any, destination: Path) -> None:
+        """Serialize ``obj`` via joblib to ``destination`` atomically."""
+        fd, tmp_path = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
+        os.close(fd)
+        try:
+            joblib.dump(obj, tmp_path)
+            os.replace(tmp_path, destination)
+        except Exception:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _atomic_write_csv(feature_names: list, destination: Path) -> None:
+        """Write the selected feature list to CSV atomically."""
+        fd, tmp_path = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
+        os.close(fd)
+        try:
+            pd.DataFrame({"feature": feature_names}).to_csv(tmp_path, index=False)
+            os.replace(tmp_path, destination)
+        except Exception:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _atomic_write_json(payload: Dict[str, Any], destination: Path) -> None:
+        """Write a metadata dictionary to JSON atomically."""
+        fd, tmp_path = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
+        os.close(fd)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as file_handle:
+                json.dump(payload, file_handle, indent=2)
+            os.replace(tmp_path, destination)
+        except Exception:
+            Path(tmp_path).unlink(missing_ok=True)
             raise
 
 
-def main() -> None:
-    """Entry point for running the model training pipeline as a script."""
-    trainer = ModelTrainer()
-    trainer.run_pipeline()
-
-
 if __name__ == "__main__":
-    main()
+    trainer = ModelTrainer()
+    trainer.run()

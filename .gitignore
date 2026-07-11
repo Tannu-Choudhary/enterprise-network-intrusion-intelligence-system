@@ -216,4 +216,46 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-data/raw/cicids2017.csv
+# ==========================
+# Large datasets
+# ==========================
+
+cicids2017.csv
+X_test.csv
+
+# Raw and processed datasets
+data/raw/*
+data/processed/*
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Keep demo/sample file
+!data/processed/sample.csv
+
+# ==========================
+# Models
+# ==========================
+
+# Keep the trained model required by the dashboard
+!models/best_model.pkl
+!models/label_encoder.pkl
+!models/selected_features.csv
+!models/training_metadata.json
+
+# Ignore temporary model artifacts
+models/scaler.pkl
+
+# ==========================
+# Logs
+# ==========================
+
+logs/
+
+# ==========================
+# Python
+# ==========================
+
+__pycache__/
+*.pyc

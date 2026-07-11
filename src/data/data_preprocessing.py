@@ -87,7 +87,7 @@ class PreprocessingConfig:
     raw_data_path: Path
     processed_data_dir: Path = Path("data/processed")
     models_dir: Path = Path("models")
-    target_column: str = "Label"
+    target_column: str = "Attack Type"
     test_size: float = 0.2
     random_state: int = 42
     drop_duplicates: bool = True
@@ -645,7 +645,7 @@ def main() -> None:
     parser.add_argument(
         "--target-column",
         type=str,
-        default="Label",
+        default="Attack Type",
         help="Name of the target/label column in the dataset.",
     )
     parser.add_argument(

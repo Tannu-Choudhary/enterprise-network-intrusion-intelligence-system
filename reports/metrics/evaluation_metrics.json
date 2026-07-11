@@ -1,0 +1,93 @@
+{
+  "scalar_metrics": {
+    "accuracy": 0.9986233381866944,
+    "precision_weighted": 0.9985315245783994,
+    "recall_weighted": 0.9986233381866944,
+    "f1_weighted": 0.9985134812551175
+  },
+  "classification_report": {
+    "0": {
+      "precision": 0.9657534246575342,
+      "recall": 0.7249357326478149,
+      "f1-score": 0.8281938325991189,
+      "support": 389.0
+    },
+    "1": {
+      "precision": 1.0,
+      "recall": 0.9989071038251366,
+      "f1-score": 0.9994532531437944,
+      "support": 1830.0
+    },
+    "2": {
+      "precision": 0.99984375,
+      "recall": 0.9997265945397024,
+      "f1-score": 0.9997851688377634,
+      "support": 25603.0
+    },
+    "3": {
+      "precision": 0.9982989252300317,
+      "recall": 0.9995870861183515,
+      "f1-score": 0.9989425903956259,
+      "support": 38749.0
+    },
+    "4": {
+      "precision": 0.9990860562731618,
+      "recall": 0.9992863604142451,
+      "f1-score": 0.9991861983050969,
+      "support": 418979.0
+    },
+    "5": {
+      "precision": 0.9900611620795107,
+      "recall": 0.9995038315232372,
+      "f1-score": 0.9947600888864503,
+      "support": 18139.0
+    },
+    "6": {
+      "precision": 0.78125,
+      "recall": 0.40792540792540793,
+      "f1-score": 0.5359877488514548,
+      "support": 429.0
+    },
+    "accuracy": 0.9986233381866944,
+    "macro avg": {
+      "precision": 0.9620419026057484,
+      "recall": 0.8756960167134137,
+      "f1-score": 0.9080441258599007,
+      "support": 504118.0
+    },
+    "weighted avg": {
+      "precision": 0.9985315245783994,
+      "recall": 0.9986233381866944,
+      "f1-score": 0.9985134812551175,
+      "support": 504118.0
+    }
+  },
+  "evaluated_model_info": {
+    "best_model_name": "XGBoost",
+    "hyperparameters": {
+      "n_estimators": 200,
+      "max_depth": 6,
+      "learning_rate": 0.1,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "objective": "multi:softprob",
+      "eval_metric": "mlogloss",
+      "tree_method": "hist",
+      "random_state": 42,
+      "n_jobs": -1,
+      "verbosity": 0
+    },
+    "validation_metrics": {
+      "accuracy": 0.998576727763231,
+      "precision_weighted": 0.9984918309936945,
+      "recall_weighted": 0.998576727763231,
+      "f1_weighted": 0.9984829638756836
+    },
+    "feature_count": 30,
+    "training_rows": 1814824,
+    "validation_rows": 201648,
+    "validation_fraction": 0.1,
+    "random_state": 42,
+    "trained_at": "2026-07-10T18:58:09.604888+00:00"
+  }
+}

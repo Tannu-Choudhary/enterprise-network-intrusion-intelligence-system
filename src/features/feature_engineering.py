@@ -1,595 +1,689 @@
 """
 feature_engineering.py
-========================
+=======================
 
-Feature engineering pipeline for the Enterprise Network Intrusion
-Intelligence System. This module consumes the cleaned/encoded output of
-``src.data.data_preprocessing`` and performs feature-space refinement:
-low-variance filtering, correlation-based redundancy removal, model-based
-feature importance ranking, optional dimensionality reduction, and
-persistence of the final selected feature set for use by the training and
-inference pipelines.
+Enterprise Network Intrusion Intelligence System
+--------------------------------------------------
+Feature engineering module responsible for selecting the most
+predictive features from the preprocessed CICIDS2017 dataset using
+Random Forest feature importances, and producing the engineered
+feature matrices consumed by the training and evaluation stages.
 
-Dataset reference:
-    https://www.kaggle.com/datasets/ericanacletoribeiro/cicids2017-cleaned-and-preprocessed
+Pipeline position
+------------------
+    data_preprocessing.py
+        data/processed/X_train.csv, X_test.csv, y_train.csv, y_test.csv
+            |
+            v
+    feature_engineering.py   <-- this module
+        data/processed/X_train_fe.csv, X_test_fe.csv, feature_importances.csv
+            |
+            v
+    train_model.py -> evaluate_model.py
 
-Author: Member A - Enterprise Network Intrusion Intelligence System
+Method
+------
+Feature selection uses ONLY Random Forest ``feature_importances_``:
+    1. Fit a Random Forest classifier on the full training set
+       (features vs. the "Attack Type" target).
+    2. Rank all features by importance, descending.
+    3. Keep the top 30 most important features.
+    4. Apply the exact same selected feature set (same names, same
+       order) to both the training and test feature matrices.
+
+No PCA, RFE, SelectKBest, Sequential Feature Selection, or mutual
+information selection is used, per project requirements.
+
+Memory considerations
+----------------------
+The training set contains over two million rows. This module:
+    - Loads each CSV exactly once.
+    - Avoids concatenating the full training and test feature sets.
+    - Avoids retaining unnecessary intermediate DataFrame copies
+      (large temporary objects are deleted and garbage-collected
+      as soon as they are no longer needed).
+    - Uses column-view based access wherever possible before the
+      unavoidable copy required to write the final engineered CSVs.
+
+This module does NOT modify ``y_train.csv`` or ``y_test.csv``.
+
+Author: Member B
 Python Version: 3.11
 """
 
 from __future__ import annotations
 
+import argparse
+import gc
 import logging
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-import joblib
-import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import VarianceThreshold
+from sklearn.preprocessing import LabelEncoder
 
 # --------------------------------------------------------------------------- #
-# Logging Configuration
+# Logging configuration
 # --------------------------------------------------------------------------- #
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    _console_handler = logging.StreamHandler(sys.stdout)
-    _console_handler.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+try:
+    from src.utils.logger import get_logger  # type: ignore
+
+    logger = get_logger(__name__)
+except ImportError:  # pragma: no cover - fallback path
+    logger = logging.getLogger(__name__)
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        _handler = logging.StreamHandler(sys.stdout)
+        _formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-    )
-    logger.addHandler(_console_handler)
+        _handler.setFormatter(_formatter)
+        logger.addHandler(_handler)
 
 
 # --------------------------------------------------------------------------- #
 # Custom Exceptions
 # --------------------------------------------------------------------------- #
 class FeatureEngineeringError(Exception):
-    """Raised when an unrecoverable error occurs during feature engineering."""
+    """Base exception for all errors raised by this module."""
 
 
-class FeatureValidationError(FeatureEngineeringError):
-    """Raised when input data fails validation prior to feature engineering."""
+class MissingArtifactError(FeatureEngineeringError):
+    """Raised when a required upstream preprocessing file is absent."""
+
+
+class DataValidationError(FeatureEngineeringError):
+    """Raised when input data fails validation checks."""
+
+
+class SelectionError(FeatureEngineeringError):
+    """Raised when feature importance ranking/selection fails."""
+
+
+class PersistenceError(FeatureEngineeringError):
+    """Raised when engineered outputs cannot be saved to disk."""
 
 
 # --------------------------------------------------------------------------- #
-# Configuration Dataclass
+# Configuration
 # --------------------------------------------------------------------------- #
 @dataclass
 class FeatureEngineeringConfig:
     """
-    Configuration container for the feature engineering pipeline.
+    Configuration container for the :class:`FeatureEngineer`.
 
-    Attributes:
-        processed_data_dir: Directory containing X_train.csv / X_test.csv /
-            y_train.csv / y_test.csv produced by the preprocessing stage.
-        models_dir: Directory where feature-engineering artifacts
-            (selected_features.csv, PCA transformer) are persisted.
-        variance_threshold: Minimum variance a feature must have to be
-            retained. Features at or below this threshold are dropped as
-            near-constant / non-informative.
-        correlation_threshold: Absolute Pearson correlation above which one
-            of a pair of features is considered redundant and dropped.
-        top_k_features: Number of top features to retain based on
-            Random Forest feature importance ranking. If None, all
-            surviving features (after variance/correlation filtering) are
-            kept.
-        apply_pca: Whether to additionally fit a PCA transformer on the
-            selected features for optional dimensionality reduction
-            (persisted separately; does not replace the selected feature
-            set by default).
-        pca_variance_ratio: Target cumulative explained variance ratio used
-            to determine the number of PCA components when apply_pca=True.
-        random_state: Seed for reproducibility in the Random Forest
-            importance estimator and PCA.
-        n_estimators: Number of trees used by the Random Forest importance
-            estimator.
+    Attributes
+    ----------
+    processed_data_dir : Path
+        Directory containing both the upstream preprocessing outputs
+        and the destination for engineered outputs.
+    x_train_file : str
+        Filename of the raw (preprocessed) training feature matrix.
+    x_test_file : str
+        Filename of the raw (preprocessed) test feature matrix.
+    y_train_file : str
+        Filename of the training labels.
+    y_test_file : str
+        Filename of the test labels.
+    x_train_fe_file : str
+        Output filename for the engineered training feature matrix.
+    x_test_fe_file : str
+        Output filename for the engineered test feature matrix.
+    importances_file : str
+        Output filename for the feature importance report.
+    target_column : str
+        Name of the target/label column within the y_* files.
+    top_n_features : int
+        Number of top-ranked features to retain.
+    rf_n_estimators : int
+        Number of trees used by the Random Forest fitted solely for
+        importance ranking (not persisted, not the final model).
+    rf_max_depth : Optional[int]
+        Maximum tree depth for the importance-ranking Random Forest.
+        Bounded to keep memory/time reasonable on 2M+ rows.
+    random_state : int
+        Seed used for reproducibility.
+    n_jobs : int
+        Number of parallel jobs for the Random Forest fit.
+        ``-1`` uses all available cores.
     """
 
-    processed_data_dir: Path = Path("data/processed")
-    models_dir: Path = Path("models")
-    variance_threshold: float = 0.0
-    correlation_threshold: float = 0.95
-    top_k_features: Optional[int] = 30
-    apply_pca: bool = False
-    pca_variance_ratio: float = 0.95
+    processed_data_dir: Path = field(default_factory=lambda: Path("data/processed"))
+    x_train_file: str = "X_train.csv"
+    x_test_file: str = "X_test.csv"
+    y_train_file: str = "y_train.csv"
+    y_test_file: str = "y_test.csv"
+    x_train_fe_file: str = "X_train_fe.csv"
+    x_test_fe_file: str = "X_test_fe.csv"
+    importances_file: str = "feature_importances.csv"
+    target_column: str = "Attack Type"
+    top_n_features: int = 30
+    rf_n_estimators: int = 100
+    rf_max_depth: Optional[int] = 20
     random_state: int = 42
-    n_estimators: int = 100
-    _reserved: list[str] = field(default_factory=list)
+    n_jobs: int = -1
+
+    @property
+    def x_train_path(self) -> Path:
+        """Full path to the raw training feature matrix."""
+        return self.processed_data_dir / self.x_train_file
+
+    @property
+    def x_test_path(self) -> Path:
+        """Full path to the raw test feature matrix."""
+        return self.processed_data_dir / self.x_test_file
+
+    @property
+    def y_train_path(self) -> Path:
+        """Full path to the training labels."""
+        return self.processed_data_dir / self.y_train_file
+
+    @property
+    def y_test_path(self) -> Path:
+        """Full path to the test labels."""
+        return self.processed_data_dir / self.y_test_file
+
+    @property
+    def x_train_fe_path(self) -> Path:
+        """Full output path for the engineered training feature matrix."""
+        return self.processed_data_dir / self.x_train_fe_file
+
+    @property
+    def x_test_fe_path(self) -> Path:
+        """Full output path for the engineered test feature matrix."""
+        return self.processed_data_dir / self.x_test_fe_file
+
+    @property
+    def importances_path(self) -> Path:
+        """Full output path for the feature importance report."""
+        return self.processed_data_dir / self.importances_file
+
+    def required_input_files(self) -> List[Path]:
+        """
+        Return the list of upstream files required before feature
+        engineering can run.
+
+        Returns
+        -------
+        List[Path]
+            All required preprocessing output paths.
+        """
+        return [self.x_train_path, self.x_test_path, self.y_train_path, self.y_test_path]
 
 
 # --------------------------------------------------------------------------- #
-# Core Feature Engineering Class
+# FeatureEngineer
 # --------------------------------------------------------------------------- #
 class FeatureEngineer:
     """
-    Encapsulates feature selection and transformation logic for the
-    intrusion detection feature space.
+    Selects the top-N most predictive features using Random Forest
+    feature importances and produces engineered feature matrices for
+    training and evaluation.
 
-    Pipeline stages:
-        1. Load processed train/test splits from disk.
-        2. Validate structural integrity.
-        3. Remove low/zero-variance features.
-        4. Remove highly correlated redundant features.
-        5. Rank remaining features by Random Forest importance and select
-           the top-k.
-        6. Optionally fit a PCA transformer for dimensionality reduction.
-        7. Persist the final selected feature list and any fitted
-           transformers.
+    The Random Forest fitted in this class is used exclusively to
+    rank feature importance; it is intentionally lightweight and is
+    NOT persisted, and it is NOT the final classification model
+    trained by ``train_model.py``.
 
-    Example:
-        >>> config = FeatureEngineeringConfig()
-        >>> engineer = FeatureEngineer(config)
-        >>> X_train_fe, X_test_fe = engineer.run()
+    Parameters
+    ----------
+    config : Optional[FeatureEngineeringConfig]
+        Configuration controlling file locations and selection
+        behavior. Defaults to standard project paths.
+
+    Examples
+    --------
+    >>> engineer = FeatureEngineer()
+    >>> engineer.run()
     """
 
-    def __init__(self, config: FeatureEngineeringConfig) -> None:
+    def __init__(self, config: Optional[FeatureEngineeringConfig] = None) -> None:
+        self.config: FeatureEngineeringConfig = config or FeatureEngineeringConfig()
+        self.selected_features: List[str] = []
+        self.importances_df: Optional[pd.DataFrame] = None
+
+        logger.info(
+            "FeatureEngineer initialized | top_n_features=%d | "
+            "processed_data_dir='%s'",
+            self.config.top_n_features,
+            self.config.processed_data_dir.resolve(),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Validation
+    # ------------------------------------------------------------------ #
+    def validate_inputs(self) -> None:
         """
-        Initialize the FeatureEngineer.
+        Verify that every upstream preprocessing output required for
+        feature engineering exists on disk.
 
-        Args:
-            config: A FeatureEngineeringConfig instance describing
-                pipeline behavior and file locations.
+        Raises
+        ------
+        MissingArtifactError
+            If one or more required files are missing.
         """
-        self.config = config
-        self.selected_features_: list[str] = []
-        self.feature_importances_: Optional[pd.Series] = None
-        self.pca_: Optional[PCA] = None
+        missing = [
+            str(p) for p in self.config.required_input_files() if not p.exists()
+        ]
 
-        logger.debug("FeatureEngineer initialized with config: %s", self.config)
-
-    # ------------------------------------------------------------------- #
-    # Step 1: Load
-    # ------------------------------------------------------------------- #
-    def load_processed_data(
-        self,
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """
-        Load the processed train/test splits produced by the preprocessing
-        stage.
-
-        Returns:
-            Tuple of (X_train, X_test, y_train, y_test).
-
-        Raises:
-            FeatureEngineeringError: If any required file is missing or
-                cannot be parsed.
-        """
-        directory = self.config.processed_data_dir
-        logger.info("Loading processed data from: %s", directory)
-
-        required_files = ["X_train.csv", "X_test.csv", "y_train.csv", "y_test.csv"]
-        missing = [f for f in required_files if not (directory / f).exists()]
         if missing:
-            raise FeatureEngineeringError(
-                f"Missing required processed data file(s): {missing} in {directory}"
+            formatted = "\n  - ".join(missing)
+            raise MissingArtifactError(
+                "Feature engineering cannot proceed: the following required "
+                f"files are missing:\n  - {formatted}\n\n"
+                "Ensure data_preprocessing.py has been run first."
             )
 
+        logger.info("All required preprocessing inputs were found.")
+
+    # ------------------------------------------------------------------ #
+    # Feature importance ranking
+    # ------------------------------------------------------------------ #
+    def _rank_feature_importances(
+        self, x_train: pd.DataFrame, y_train: pd.Series
+    ) -> pd.DataFrame:
+        """
+        Fit a Random Forest on the training data and rank all features
+        by importance, descending.
+
+        Parameters
+        ----------
+        x_train : pd.DataFrame
+            Raw (preprocessed) training feature matrix.
+        y_train : pd.Series
+            Training target labels (string class names).
+
+        Returns
+        -------
+        pd.DataFrame
+            Two-column DataFrame with ``feature`` and ``importance``,
+            sorted by importance descending.
+
+        Raises
+        ------
+        SelectionError
+            If the Random Forest fails to fit or importances cannot
+            be extracted.
+        """
         try:
-            X_train = pd.read_csv(directory / "X_train.csv")
-            X_test = pd.read_csv(directory / "X_test.csv")
-            y_train = pd.read_csv(directory / "y_train.csv").squeeze("columns")
-            y_test = pd.read_csv(directory / "y_test.csv").squeeze("columns")
+            non_numeric = x_train.select_dtypes(exclude=["number"]).columns.tolist()
+            if non_numeric:
+                raise DataValidationError(
+                    f"Non-numeric feature columns detected: {non_numeric}. "
+                    "Ensure data_preprocessing.py has fully encoded all "
+                    "feature columns."
+                )
+
+            # Local, non-persisted label encoding solely to allow the
+            # Random Forest importance fit; this encoder is discarded
+            # after use and is NOT the encoder saved by train_model.py.
+            local_encoder = LabelEncoder()
+            y_encoded = local_encoder.fit_transform(y_train)
 
             logger.info(
-                "Processed data loaded. X_train: %s, X_test: %s",
-                X_train.shape,
-                X_test.shape,
-            )
-            return X_train, X_test, y_train, y_test
-
-        except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
-            logger.error("Failed to parse processed data files: %s", exc)
-            raise FeatureEngineeringError(
-                f"Failed to parse processed data files: {exc}"
-            ) from exc
-
-    # ------------------------------------------------------------------- #
-    # Step 2: Validate
-    # ------------------------------------------------------------------- #
-    @staticmethod
-    def validate_inputs(X_train: pd.DataFrame, y_train: pd.Series) -> None:
-        """
-        Validate that feature and target data are non-empty, aligned, and
-        numeric.
-
-        Args:
-            X_train: Training feature matrix.
-            y_train: Training target vector.
-
-        Raises:
-            FeatureValidationError: If validation fails.
-        """
-        logger.info("Validating feature engineering inputs.")
-
-        if X_train.empty:
-            raise FeatureValidationError("X_train is empty.")
-
-        if len(X_train) != len(y_train):
-            raise FeatureValidationError(
-                f"Row count mismatch: X_train has {len(X_train)} rows, "
-                f"y_train has {len(y_train)} rows."
+                "Fitting Random Forest for feature importance ranking | "
+                "n_estimators=%d | max_depth=%s | rows=%d | columns=%d",
+                self.config.rf_n_estimators,
+                self.config.rf_max_depth,
+                x_train.shape[0],
+                x_train.shape[1],
             )
 
-        non_numeric = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
-        if non_numeric:
-            raise FeatureValidationError(
-                f"X_train contains non-numeric columns: {non_numeric}"
+            start_time = time.time()
+            importance_rf = RandomForestClassifier(
+                n_estimators=self.config.rf_n_estimators,
+                max_depth=self.config.rf_max_depth,
+                random_state=self.config.random_state,
+                n_jobs=self.config.n_jobs,
+            )
+            importance_rf.fit(x_train, y_encoded)
+            elapsed = time.time() - start_time
+
+            importances_df = pd.DataFrame(
+                {
+                    "feature": x_train.columns,
+                    "importance": importance_rf.feature_importances_,
+                }
+            ).sort_values(by="importance", ascending=False, ignore_index=True)
+
+            logger.info(
+                "Feature importance ranking complete in %.2fs | "
+                "top_feature='%s' (%.4f)",
+                elapsed,
+                importances_df.iloc[0]["feature"],
+                importances_df.iloc[0]["importance"],
             )
 
-        logger.info("Input validation passed.")
+            # Free the importance-only model and encoder explicitly; they
+            # are not needed beyond this point and the RF can be large.
+            del importance_rf, local_encoder, y_encoded
+            gc.collect()
 
-    # ------------------------------------------------------------------- #
-    # Step 3: Variance filtering
-    # ------------------------------------------------------------------- #
-    def remove_low_variance_features(
-        self, X_train: pd.DataFrame, X_test: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+            return importances_df
+
+        except DataValidationError:
+            logger.exception("Feature importance ranking aborted: invalid input.")
+            raise
+        except Exception as exc:
+            logger.exception("Failed to compute feature importances.")
+            raise SelectionError(f"Feature importance ranking failed: {exc}") from exc
+
+    # ------------------------------------------------------------------ #
+    # Selection
+    # ------------------------------------------------------------------ #
+    def select_top_features(self, importances_df: pd.DataFrame) -> List[str]:
         """
-        Remove features whose variance is at or below the configured
-        threshold, as they carry little to no discriminative signal.
+        Select the top-N most important feature names.
 
-        Args:
-            X_train: Training feature matrix.
-            X_test: Test feature matrix.
+        Parameters
+        ----------
+        importances_df : pd.DataFrame
+            Output of :meth:`_rank_feature_importances`, sorted
+            descending by importance.
 
-        Returns:
-            Tuple of (X_train, X_test) with low-variance columns removed.
+        Returns
+        -------
+        List[str]
+            Ordered list of the top-N selected feature names.
 
-        Raises:
-            FeatureEngineeringError: If variance filtering removes all
-                features.
+        Raises
+        ------
+        SelectionError
+            If fewer features are available than requested.
         """
+        available = len(importances_df)
+        if available < self.config.top_n_features:
+            raise SelectionError(
+                f"Requested top_n_features={self.config.top_n_features}, but "
+                f"only {available} features are available."
+            )
+
+        top_features = importances_df.head(self.config.top_n_features)[
+            "feature"
+        ].tolist()
+
         logger.info(
-            "Applying variance threshold filtering (threshold=%.4f).",
-            self.config.variance_threshold,
+            "Selected top %d features (of %d total).",
+            len(top_features),
+            available,
         )
-        try:
-            selector = VarianceThreshold(threshold=self.config.variance_threshold)
-            selector.fit(X_train)
+        return top_features
 
-            retained_mask = selector.get_support()
-            retained_cols = X_train.columns[retained_mask].tolist()
-            dropped_cols = X_train.columns[~retained_mask].tolist()
-
-            if dropped_cols:
-                logger.info(
-                    "Dropped %d low-variance feature(s): %s",
-                    len(dropped_cols),
-                    dropped_cols,
-                )
-
-            if not retained_cols:
-                raise FeatureEngineeringError(
-                    "All features were removed by variance thresholding; "
-                    "consider lowering variance_threshold."
-                )
-
-            return X_train[retained_cols], X_test[retained_cols]
-
-        except ValueError as exc:
-            logger.error("Variance filtering failed: %s", exc)
-            raise FeatureEngineeringError(f"Variance filtering failed: {exc}") from exc
-
-    # ------------------------------------------------------------------- #
-    # Step 4: Correlation filtering
-    # ------------------------------------------------------------------- #
-    def remove_correlated_features(
-        self, X_train: pd.DataFrame, X_test: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Identify pairs of features with absolute Pearson correlation above
-        the configured threshold and drop one feature from each redundant
-        pair, retaining the first-encountered column.
-
-        Args:
-            X_train: Training feature matrix.
-            X_test: Test feature matrix.
-
-        Returns:
-            Tuple of (X_train, X_test) with redundant columns removed.
-        """
-        logger.info(
-            "Removing highly correlated features (threshold=%.2f).",
-            self.config.correlation_threshold,
-        )
-        try:
-            corr_matrix = X_train.corr().abs()
-            upper_triangle = corr_matrix.where(
-                np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-            )
-
-            to_drop = [
-                column
-                for column in upper_triangle.columns
-                if any(upper_triangle[column] > self.config.correlation_threshold)
-            ]
-
-            if to_drop:
-                logger.info(
-                    "Dropped %d redundant correlated feature(s): %s",
-                    len(to_drop),
-                    to_drop,
-                )
-                X_train = X_train.drop(columns=to_drop)
-                X_test = X_test.drop(columns=to_drop)
-            else:
-                logger.info("No redundant correlated features found.")
-
-            return X_train, X_test
-
-        except Exception as exc:  # noqa: BLE001 - guard against unexpected corr issues
-            logger.error("Correlation filtering failed: %s", exc)
-            raise FeatureEngineeringError(
-                f"Correlation filtering failed: {exc}"
-            ) from exc
-
-    # ------------------------------------------------------------------- #
-    # Step 5: Importance-based selection
-    # ------------------------------------------------------------------- #
-    def select_top_features_by_importance(
+    # ------------------------------------------------------------------ #
+    # Persistence
+    # ------------------------------------------------------------------ #
+    def save_outputs(
         self,
-        X_train: pd.DataFrame,
-        X_test: pd.DataFrame,
-        y_train: pd.Series,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Rank remaining features using a Random Forest classifier's
-        impurity-based feature importances and retain the top-k features.
-
-        Args:
-            X_train: Training feature matrix (post variance/correlation
-                filtering).
-            X_test: Test feature matrix (post variance/correlation
-                filtering).
-            y_train: Encoded training target vector.
-
-        Returns:
-            Tuple of (X_train, X_test) restricted to the top-k most
-            important features. If ``top_k_features`` is None or exceeds
-            the number of available features, all features are retained.
-
-        Raises:
-            FeatureEngineeringError: If the importance model fails to fit.
-        """
-        logger.info("Ranking features by Random Forest importance.")
-        try:
-            rf = RandomForestClassifier(
-                n_estimators=self.config.n_estimators,
-                random_state=self.config.random_state,
-                n_jobs=-1,
-            )
-            rf.fit(X_train, y_train)
-
-            importances = pd.Series(
-                rf.feature_importances_, index=X_train.columns
-            ).sort_values(ascending=False)
-            self.feature_importances_ = importances
-
-            logger.info(
-                "Top 10 features by importance:\n%s", importances.head(10).to_string()
-            )
-
-            k = self.config.top_k_features
-            if k is None or k >= len(importances):
-                selected = importances.index.tolist()
-                logger.info(
-                    "Retaining all %d available features (top_k_features not "
-                    "restrictive).",
-                    len(selected),
-                )
-            else:
-                selected = importances.head(k).index.tolist()
-                logger.info("Selected top %d feature(s) by importance.", k)
-
-            self.selected_features_ = selected
-            return X_train[selected], X_test[selected]
-
-        except ValueError as exc:
-            logger.error("Feature importance ranking failed: %s", exc)
-            raise FeatureEngineeringError(
-                f"Feature importance ranking failed: {exc}"
-            ) from exc
-
-    # ------------------------------------------------------------------- #
-    # Step 6: Optional PCA
-    # ------------------------------------------------------------------- #
-    def apply_pca_transform(
-        self, X_train: pd.DataFrame, X_test: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Optionally fit a PCA transformer on the selected feature set to
-        further reduce dimensionality while preserving a target cumulative
-        explained variance ratio.
-
-        Args:
-            X_train: Selected training feature matrix.
-            X_test: Selected test feature matrix.
-
-        Returns:
-            Tuple of (X_train_pca, X_test_pca) as DataFrames with PCA
-            component columns. Returns the input unchanged if
-            ``apply_pca`` is False.
-
-        Raises:
-            FeatureEngineeringError: If PCA fitting fails.
-        """
-        if not self.config.apply_pca:
-            logger.info("PCA disabled via config; skipping dimensionality reduction.")
-            return X_train, X_test
-
-        logger.info(
-            "Applying PCA (target explained variance ratio=%.2f).",
-            self.config.pca_variance_ratio,
-        )
-        try:
-            self.pca_ = PCA(
-                n_components=self.config.pca_variance_ratio,
-                random_state=self.config.random_state,
-                svd_solver="full",
-            )
-            X_train_pca = self.pca_.fit_transform(X_train)
-            X_test_pca = self.pca_.transform(X_test)
-
-            component_cols = [f"PC{i + 1}" for i in range(X_train_pca.shape[1])]
-            logger.info(
-                "PCA reduced feature space from %d to %d components "
-                "(explained variance: %.4f).",
-                X_train.shape[1],
-                X_train_pca.shape[1],
-                float(np.sum(self.pca_.explained_variance_ratio_)),
-            )
-
-            return (
-                pd.DataFrame(X_train_pca, columns=component_cols, index=X_train.index),
-                pd.DataFrame(X_test_pca, columns=component_cols, index=X_test.index),
-            )
-
-        except ValueError as exc:
-            logger.error("PCA transformation failed: %s", exc)
-            raise FeatureEngineeringError(f"PCA transformation failed: {exc}") from exc
-
-    # ------------------------------------------------------------------- #
-    # Step 7: Persist
-    # ------------------------------------------------------------------- #
-    def save_artifacts(
-        self, X_train: pd.DataFrame, X_test: pd.DataFrame
+        x_train_fe: pd.DataFrame,
+        x_test_fe: pd.DataFrame,
+        importances_df: pd.DataFrame,
     ) -> None:
         """
-        Persist the final selected feature list, feature importance
-        scores, engineered datasets, and (if fitted) the PCA transformer
-        to disk.
+        Persist the engineered training/test feature matrices and the
+        full feature importance report to disk.
 
-        Args:
-            X_train: Final engineered training feature matrix.
-            X_test: Final engineered test feature matrix.
+        Parameters
+        ----------
+        x_train_fe : pd.DataFrame
+            Engineered training feature matrix (top-N columns only).
+        x_test_fe : pd.DataFrame
+            Engineered test feature matrix (identical columns/order
+            to ``x_train_fe``).
+        importances_df : pd.DataFrame
+            Full feature importance ranking (all features, not just
+            the selected top-N), for transparency and reporting.
 
-        Raises:
-            FeatureEngineeringError: If saving any artifact fails.
+        Raises
+        ------
+        PersistenceError
+            If any output file fails to save.
         """
         try:
-            self.config.models_dir.mkdir(parents=True, exist_ok=True)
             self.config.processed_data_dir.mkdir(parents=True, exist_ok=True)
 
-            pd.Series(self.selected_features_, name="feature").to_csv(
-                self.config.models_dir / "selected_features.csv", index=False
+            x_train_fe.to_csv(self.config.x_train_fe_path, index=False)
+            logger.info(
+                "Engineered training features saved to '%s' | shape=%s",
+                self.config.x_train_fe_path,
+                x_train_fe.shape,
             )
-            logger.info("Selected feature list saved to selected_features.csv.")
 
-            if self.feature_importances_ is not None:
-                self.feature_importances_.rename("importance").to_csv(
-                    self.config.processed_data_dir / "feature_importances.csv"
+            x_test_fe.to_csv(self.config.x_test_fe_path, index=False)
+            logger.info(
+                "Engineered test features saved to '%s' | shape=%s",
+                self.config.x_test_fe_path,
+                x_test_fe.shape,
+            )
+
+            selected_set = set(x_train_fe.columns)
+            report_df = importances_df.copy()
+            report_df["selected"] = report_df["feature"].isin(selected_set)
+            report_df.to_csv(self.config.importances_path, index=False)
+            logger.info(
+                "Feature importance report saved to '%s' | total_features=%d",
+                self.config.importances_path,
+                len(report_df),
+            )
+
+        except Exception as exc:
+            logger.exception("Failed to save feature engineering outputs.")
+            raise PersistenceError(f"Failed to save outputs: {exc}") from exc
+
+    # ------------------------------------------------------------------ #
+    # Orchestration
+    # ------------------------------------------------------------------ #
+    def run(self) -> List[str]:
+        """
+        Execute the full feature engineering pipeline end to end:
+        validate inputs, load data (each file exactly once), rank
+        importances, select the top-N features, and persist outputs.
+
+        Returns
+        -------
+        List[str]
+            The ordered list of selected feature names.
+
+        Raises
+        ------
+        FeatureEngineeringError
+            If any stage of the pipeline fails.
+        """
+        pipeline_start = time.time()
+        logger.info("Starting feature engineering pipeline.")
+
+        try:
+            self.validate_inputs()
+
+            # Load each CSV exactly once.
+            logger.info("Loading X_train from '%s'", self.config.x_train_path)
+            x_train = pd.read_csv(self.config.x_train_path)
+
+            logger.info("Loading y_train from '%s'", self.config.y_train_path)
+            y_train_df = pd.read_csv(self.config.y_train_path)
+
+            if self.config.target_column in y_train_df.columns:
+                y_train = y_train_df[self.config.target_column]
+            else:
+                # Fall back to the first (and typically only) column if the
+                # expected target column name is not present verbatim.
+                y_train = y_train_df.iloc[:, 0]
+
+            if len(x_train) != len(y_train):
+                raise DataValidationError(
+                    f"Row count mismatch between X_train ({len(x_train)}) and "
+                    f"y_train ({len(y_train)})."
                 )
-                logger.info("Feature importances saved.")
 
-            X_train.to_csv(
-                self.config.processed_data_dir / "X_train_fe.csv", index=False
+            importances_df = self._rank_feature_importances(x_train, y_train)
+            self.selected_features = self.select_top_features(importances_df)
+            self.importances_df = importances_df
+
+            # Build the engineered training matrix, then release the raw
+            # training matrix and labels before loading the test set, to
+            # avoid holding two multi-million-row feature sets at once.
+            x_train_fe = x_train[self.selected_features].copy()
+            del x_train, y_train, y_train_df
+            gc.collect()
+
+            logger.info("Loading X_test from '%s'", self.config.x_test_path)
+            x_test = pd.read_csv(self.config.x_test_path)
+
+            missing_in_test = set(self.selected_features) - set(x_test.columns)
+            if missing_in_test:
+                raise DataValidationError(
+                    f"Selected features missing from X_test: {sorted(missing_in_test)}"
+                )
+
+            x_test_fe = x_test[self.selected_features].copy()
+            del x_test
+            gc.collect()
+
+            self.save_outputs(x_train_fe, x_test_fe, importances_df)
+
+            del x_train_fe, x_test_fe
+            gc.collect()
+
+            elapsed_total = time.time() - pipeline_start
+            logger.info(
+                "Feature engineering pipeline completed successfully in %.2fs.",
+                elapsed_total,
             )
-            X_test.to_csv(
-                self.config.processed_data_dir / "X_test_fe.csv", index=False
-            )
-            logger.info("Engineered feature sets saved (X_train_fe.csv, X_test_fe.csv).")
+            return self.selected_features
 
-            if self.pca_ is not None:
-                joblib.dump(self.pca_, self.config.models_dir / "pca_transformer.pkl")
-                logger.info("PCA transformer artifact saved.")
-
-        except OSError as exc:
-            logger.error("Failed to save feature engineering artifacts: %s", exc)
-            raise FeatureEngineeringError(
-                f"Failed to save feature engineering artifacts: {exc}"
-            ) from exc
-
-    # ------------------------------------------------------------------- #
-    # Orchestrator
-    # ------------------------------------------------------------------- #
-    def run(self, persist: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Execute the full feature engineering pipeline end-to-end.
-
-        Args:
-            persist: If True, saves engineered datasets and fitted
-                artifacts to disk. Set to False for in-memory/testing use.
-
-        Returns:
-            Tuple of (X_train_engineered, X_test_engineered).
-
-        Raises:
-            FeatureEngineeringError: Propagated from any pipeline stage on
-                unrecoverable failure.
-        """
-        logger.info("=== Starting feature engineering pipeline ===")
-
-        X_train, X_test, y_train, y_test = self.load_processed_data()
-        self.validate_inputs(X_train, y_train)
-
-        X_train, X_test = self.remove_low_variance_features(X_train, X_test)
-        X_train, X_test = self.remove_correlated_features(X_train, X_test)
-        X_train, X_test = self.select_top_features_by_importance(
-            X_train, X_test, y_train
-        )
-        X_train, X_test = self.apply_pca_transform(X_train, X_test)
-
-        if persist:
-            self.save_artifacts(X_train, X_test)
-
-        logger.info("=== Feature engineering pipeline completed successfully ===")
-        return X_train, X_test
+        except FeatureEngineeringError:
+            logger.exception("Feature engineering pipeline aborted.")
+            raise
+        except Exception as exc:  # pragma: no cover - defensive catch-all
+            logger.exception("Unexpected error in feature engineering pipeline.")
+            raise FeatureEngineeringError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #
-# CLI Entry Point
+# CLI argument parsing
 # --------------------------------------------------------------------------- #
-def main() -> None:
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
-    Command-line entry point for running the feature engineering pipeline
-    standalone, e.g.:
+    Parse command-line arguments for standalone execution.
 
-        python -m src.features.feature_engineering --top-k 30
+    Parameters
+    ----------
+    argv : Optional[List[str]]
+        Argument list to parse. Defaults to ``sys.argv[1:]`` when
+        ``None``. Exposed for unit testing.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments.
     """
-    import argparse
-
     parser = argparse.ArgumentParser(
-        description="Engineer and select features for CICIDS2017 intrusion data."
+        prog="feature_engineering.py",
+        description=(
+            "Select the top-N most important features via Random Forest "
+            "feature_importances_ and produce X_train_fe.csv, "
+            "X_test_fe.csv, and feature_importances.csv."
+        ),
     )
+
     parser.add_argument(
         "--processed-data-dir",
         type=str,
         default="data/processed",
-        help="Directory containing processed train/test CSV files.",
+        help="Directory containing preprocessing outputs. Default: 'data/processed'.",
     )
     parser.add_argument(
-        "--top-k",
+        "--target-column",
+        type=str,
+        default="Attack Type",
+        help="Name of the target column in y_train.csv/y_test.csv. Default: 'Attack Type'.",
+    )
+    parser.add_argument(
+        "--top-n-features",
         type=int,
         default=30,
-        help="Number of top features to retain by importance ranking.",
+        help="Number of top-ranked features to retain. Default: 30.",
     )
     parser.add_argument(
-        "--apply-pca",
-        action="store_true",
-        help="If set, additionally fit a PCA transformer on selected features.",
+        "--rf-n-estimators",
+        type=int,
+        default=100,
+        help="Number of trees in the importance-ranking Random Forest. Default: 100.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--rf-max-depth",
+        type=int,
+        default=20,
+        help="Max tree depth for the importance-ranking Random Forest. Default: 20.",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility. Default: 42.",
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=-1,
+        help="Number of parallel jobs for the Random Forest fit. Default: -1 (all cores).",
+    )
+
+    return parser.parse_args(argv)
+
+
+# --------------------------------------------------------------------------- #
+# Main entry point
+# --------------------------------------------------------------------------- #
+def main(argv: Optional[List[str]] = None) -> int:
+    """
+    Execute the feature engineering pipeline as a standalone script.
+
+    Parameters
+    ----------
+    argv : Optional[List[str]]
+        Command-line arguments (excluding program name). Defaults to
+        ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        Process exit code: ``0`` on success, ``1`` on failure.
+    """
+    args = parse_arguments(argv)
+
+    logger.info("=" * 70)
+    logger.info("Starting Feature Engineering Pipeline")
+    logger.info("=" * 70)
 
     try:
         config = FeatureEngineeringConfig(
             processed_data_dir=Path(args.processed_data_dir),
-            top_k_features=args.top_k,
-            apply_pca=args.apply_pca,
+            target_column=args.target_column,
+            top_n_features=args.top_n_features,
+            rf_n_estimators=args.rf_n_estimators,
+            rf_max_depth=args.rf_max_depth,
+            random_state=args.random_state,
+            n_jobs=args.n_jobs,
         )
-        engineer = FeatureEngineer(config)
-        engineer.run(persist=True)
+
+        engineer = FeatureEngineer(config=config)
+        selected = engineer.run()
+
+        logger.info("Selected features (%d): %s", len(selected), selected)
+        return 0
+
     except FeatureEngineeringError as exc:
-        logger.critical("Feature engineering pipeline failed: %s", exc)
-        sys.exit(1)
+        logger.error("Feature engineering aborted: %s", exc)
+        return 1
+    except Exception:  # pragma: no cover - defensive catch-all
+        logger.exception("Feature engineering aborted due to an unexpected error.")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
